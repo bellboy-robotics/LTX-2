@@ -870,6 +870,9 @@ class ValidationRunner:
         sampling_ctx: SamplingContext,
     ) -> tuple[LatentState | None, LatentState | None]:
         """Run the Euler denoising loop with CFG/STG, handling frozen modalities."""
+        # Under `accelerate launch` with >1 process, `transformer` is wrapped in DistributedDataParallel,
+        # which forwards forward() but not custom attributes like `num_blocks`. Unwrap once here.
+        base_transformer = getattr(transformer, "module", transformer)
         cfg = self._config
         scheduler = LTX2Scheduler()
         sigmas = scheduler.execute(steps=cfg.inference_steps).to(device).float()
@@ -929,7 +932,7 @@ class ValidationRunner:
                 video_enabled=video is not None and video_guider.do_perturbed_generation(),
                 audio_enabled=audio is not None and audio_guider.do_perturbed_generation(),
                 stg_blocks=cfg.stg_blocks,
-                num_blocks=transformer.num_blocks,
+                num_blocks=base_transformer.num_blocks,
                 device=device,
                 dtype=transformer_dtype,
             )
@@ -941,7 +944,7 @@ class ValidationRunner:
                 audio is not None and audio_guider.do_isolated_modality_generation()
             ):
                 mod_perturbation_config = self._build_modality_perturbation_config(
-                    transformer.num_blocks, device, transformer_dtype
+                    base_transformer.num_blocks, device, transformer_dtype
                 )
                 mod_video, mod_audio = x0_model(video=video, audio=audio, perturbations=mod_perturbation_config)
 
