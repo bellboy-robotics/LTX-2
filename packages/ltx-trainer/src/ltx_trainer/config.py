@@ -306,6 +306,22 @@ class LoraConfig(ConfigBaseModel):
         description="List of modules to target with LoRA",
     )
 
+    modules_to_save: list[str] = Field(
+        default_factory=list,
+        description="Modules trained in full rather than through a LoRA adapter, and saved into "
+        "the adapter checkpoint. Use this for parameters that have no pretrained weights to adapt "
+        "-- for the WAM, ['action_in', 'action_out'], which are new Linears initialized from "
+        "scratch. A low-rank update to a random matrix would be pointless.",
+    )
+
+    extra_trainable_params: list[str] = Field(
+        default_factory=list,
+        description="Substrings matched against parameter names. Any parameter whose name "
+        "contains one becomes trainable and is written into the checkpoint alongside the adapter. "
+        "This exists for bare nn.Parameters, which PEFT's modules_to_save cannot reach because it "
+        "operates on modules -- for the WAM, ['action_scale_shift_table'].",
+    )
+
 
 def _get_strategy_discriminator(v: dict | TrainingStrategyConfigBase) -> str:
     """Discriminator function for strategy config union."""

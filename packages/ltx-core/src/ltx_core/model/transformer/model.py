@@ -78,6 +78,7 @@ class LTXModel(torch.nn.Module, Disposable):
         ff_bias: bool = True,
         audio_ff_bias: bool = True,
         use_keyframes_abs_pos_embedding: bool = False,
+        action_channels: int = 0,
     ):
         super().__init__()
         # Log the attention backends this transformer is built with. Reading the resolved
@@ -112,6 +113,10 @@ class LTXModel(torch.nn.Module, Disposable):
                 norm_eps=norm_eps,
                 caption_projection=caption_projection,
             )
+            # WAM: action tokens ride inside the video stream, so this depends on inner_dim
+            # and must follow _init_video.
+            if action_channels:
+                self._init_action(action_channels=action_channels)
 
         if model_type.is_audio_enabled():
             if audio_positional_embedding_max_pos is None:
@@ -231,6 +236,53 @@ class LTXModel(torch.nn.Module, Disposable):
         self.norm_out = torch.nn.LayerNorm(self.inner_dim, elementwise_affine=False, eps=norm_eps)
         self.proj_out = torch.nn.Linear(self.inner_dim, out_channels)
 
+    def _init_action(self, action_channels: int) -> None:
+        """Initialize the WAM action stream.
+
+        Action tokens are interleaved into the video sequence -- they share its self-attention,
+        timesteps and RoPE clock -- but get their own entry and exit projections, because
+        ``patchify_proj`` and ``proj_out`` are shaped for the video stream's VAE channels and an
+        action is a different modality.
+
+        They also get their own ``action_scale_shift_table``. That is *not* redundant with
+        ``action_out``, unlike the two things below. Writing ``a`` for one channel of the table's
+        scale row, ``e`` for the matching entry of ``embedded_timestep`` and ``w`` for the weight
+        in ``action_out``, the output is ``w * (1 + a + e) * x``. Comparing two noise levels,
+        ``out(e=0) / out(e=1) = (1 + a) / (2 + a)`` -- ``w`` cancels. So ``a`` fixes how strongly
+        the action output responds to the denoising step, and no trained ``w`` can reproduce a
+        different ``a``: it would have to take one value to match the ``e``-dependent term and
+        another to match the constant one. Zero-initialized, which leaves the modulation as the
+        timestep alone.
+
+        ``norm_out`` stays shared -- ``elementwise_affine=False``, so it has no parameters to
+        differentiate.
+
+        There is no separate modality marker, and no separate shift. Both *are* redundant:
+        a marker is a constant vector added after ``action_in``, and every action token goes
+        through ``action_in`` while no video token does, so ``Wx + b + marker == Wx + (b + marker)``
+        -- it could only reparameterise ``action_in.bias``. The shift row reaches ``action_out``
+        as ``W*shift + b``, a constant, absorbed into ``action_out.bias`` the same way. The shift
+        differs from the scale precisely because it is not multiplied by ``x``, so it never
+        interacts with the timestep term. This also differs from ``keyframes_abs_pos_embedding``,
+        which marks a *subset* of tokens that otherwise share ``patchify_proj``, so there the
+        marker is the only thing distinguishing them.
+        """
+        self.action_channels = action_channels
+        self.action_in = torch.nn.Linear(action_channels, self.inner_dim, bias=True)
+        self.action_out = torch.nn.Linear(self.inner_dim, action_channels)
+        self.action_scale_shift_table = torch.nn.Parameter(torch.zeros(2, self.inner_dim))
+
+    def _action_projection(self) -> torch.nn.Linear | None:
+        """Resolve the action entry projection, or ``None`` when this model has no action stream.
+        Looked up per call rather than captured, for the same reason as ``_keyframes_embedding``:
+        a parameter the checkpoint did not supply is materialized later, which replaces the
+        parameter object.
+        """
+        action_in = getattr(self, "action_in", None)
+        if action_in is None or action_in.weight.is_meta:
+            return None
+        return action_in
+
     def _init_audio(
         self,
         in_channels: int,
@@ -312,6 +364,7 @@ class LTXModel(torch.nn.Module, Disposable):
                 caption_projection=getattr(self, "caption_projection", None),
                 prompt_adaln=getattr(self, "prompt_adaln_single", None),
                 keyframes_embedding_provider=self._keyframes_embedding,
+                action_projection_provider=self._action_projection,
             )
             self.audio_args_preprocessor = MultiModalTransformerArgsPreprocessor(
                 patchify_proj=self.audio_patchify_proj,
@@ -347,6 +400,7 @@ class LTXModel(torch.nn.Module, Disposable):
                 caption_projection=getattr(self, "caption_projection", None),
                 prompt_adaln=getattr(self, "prompt_adaln_single", None),
                 keyframes_embedding_provider=self._keyframes_embedding,
+                action_projection_provider=self._action_projection,
             )
         elif self.model_type.is_audio_enabled():
             self.audio_args_preprocessor = TransformerArgsPreprocessor(
@@ -476,18 +530,40 @@ class LTXModel(torch.nn.Module, Disposable):
         proj_out: torch.nn.Linear,
         x: torch.Tensor,
         embedded_timestep: torch.Tensor,
+        action_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Process output for LTXV."""
-        # Apply scale-shift modulation
-        scale_shift_values = (
-            scale_shift_table[None, None].to(device=x.device, dtype=x.dtype) + embedded_timestep[:, :, None]
-        )
-        shift, scale = scale_shift_values[:, :, 0], scale_shift_values[:, :, 1]
+        """Process output for LTXV.
 
-        x = norm_out(x)
-        x = x * (1 + scale) + shift
-        x = proj_out(x)
-        return x
+        Where ``action_mask`` is True the token is a WAM action rather than a video patch. Action
+        tokens share ``norm_out``, which has no parameters, but take their own scale-shift
+        modulation from ``action_scale_shift_table`` and leave through ``action_out`` instead of
+        ``proj_out``. See ``_init_action`` for why the scale row cannot be folded into
+        ``action_out`` while the shift row can.
+
+        Because the action tokens are interleaved rather than contiguous, both modulations and
+        both projections are evaluated over the whole sequence and selected between, mirroring
+        the entry path.
+
+        The action prediction occupies the leading ``action_channels`` of its row and the rest is
+        zero, so the result keeps one shape and every caller that unpacks ``(video, audio)`` is
+        unaffected. The trainer reads ``[..., :action_channels]`` off the masked rows.
+        """
+
+        x_norm = norm_out(x)
+
+        def modulate(table: torch.Tensor) -> torch.Tensor:
+            values = table[None, None].to(device=x_norm.device, dtype=x_norm.dtype) + embedded_timestep[:, :, None]
+            shift, scale = values[:, :, 0], values[:, :, 1]
+            return x_norm * (1 + scale) + shift
+
+        video = proj_out(modulate(scale_shift_table))
+        if action_mask is None:
+            return video
+
+        action = self.action_out(modulate(self.action_scale_shift_table))
+        padded = torch.zeros_like(video)
+        padded[..., : action.shape[-1]] = action
+        return torch.where(action_mask.unsqueeze(-1), padded, video)
 
     def forward(
         self, video: Modality | None, audio: Modality | None, perturbations: BatchedPerturbationConfig | None
@@ -519,7 +595,12 @@ class LTXModel(torch.nn.Module, Disposable):
         # Process output
         vx = (
             self._process_output(
-                self.scale_shift_table, self.norm_out, self.proj_out, video_out.x, video_out.embedded_timestep
+                self.scale_shift_table,
+                self.norm_out,
+                self.proj_out,
+                video_out.x,
+                video_out.embedded_timestep,
+                action_mask=video_out.action_mask,
             )
             if video_out is not None
             else None

@@ -61,6 +61,16 @@ class Modality:
     context_mask: torch.Tensor | None = None
     attention_mask: torch.Tensor | None = None
     keyframes_mask: torch.Tensor | None = None  # Shape: (B, T, 1), non-zero on single-pixel-frame latents
+    # WAM: ``(B, T)`` boolean, True on tokens that are robot actions rather than video patches.
+    # Action tokens are interleaved among the video tokens in timestamp order -- the exact layout
+    # is the training strategy's to decide -- so they share the stream's timesteps, RoPE clock,
+    # self-attention and sequence, and their ordering stays meaningful if attention is later made
+    # causal. They enter through ``action_in`` instead of ``patchify_proj`` and leave
+    # through ``action_out`` instead of ``proj_out``. Their rows of ``latent`` carry the action
+    # VAE's channels in ``[..., :action_channels]``, zero-padded out to the video ``in_channels``
+    # so the sequence remains a single tensor and every shape downstream is unchanged.
+    # ``None`` -- the default -- means no action tokens, which is every non-WAM model.
+    action_mask: torch.Tensor | None = None
 
     def split(self, sizes: list[int]) -> list[Modality]:
         """Split along the batch dimension into chunks of the given sizes."""

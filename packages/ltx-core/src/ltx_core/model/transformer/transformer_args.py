@@ -43,6 +43,55 @@ def apply_keyframes_absolute_embedding(
     return hidden_states + mask * embedding.to(dtype=hidden_states.dtype)
 
 
+#: Resolves the WAM action entry projection ``Linear(action_channels -> inner_dim)``, or ``None``
+#: when the model has no action stream. A provider for the same reason as
+#: ``KeyframesEmbeddingProvider``.
+ActionProjectionProvider = Callable[[], torch.nn.Linear | None]
+
+
+def apply_action_projection(
+    video_x: torch.Tensor,
+    latent: torch.Tensor,
+    action_mask: torch.Tensor | None,
+    projection_provider: ActionProjectionProvider | None,
+) -> torch.Tensor:
+    """Replace the action positions of a projected sequence with ``action_in`` outputs.
+
+    Action tokens are interleaved among the video tokens in timestamp order, so they are not a
+    contiguous slice. Rather than gathering them out and scattering them back -- which produces
+    data-dependent shapes and breaks compilation -- both projections are evaluated over the whole
+    sequence and selected between with ``torch.where``. The waste is negligible: ``action_in`` is
+    ``Linear(action_channels -> inner_dim)`` with a single-digit input width, so running it over
+    the video positions too is a rounding error against the transformer blocks.
+
+    Args:
+        video_x: ``(B, T, D)`` sequence already projected by ``patchify_proj``, with the keyframe
+            embedding applied.
+        latent: ``(B, T, C)`` the raw latents. Action rows carry the action VAE's channels in
+            ``[..., :action_channels]``; the padding beyond that is ignored.
+        action_mask: ``(B, T)`` boolean, True on action positions. ``None`` short-circuits.
+        projection_provider: resolves ``action_in``.
+
+    Returns:
+        ``(B, T, D)`` with video positions untouched and action positions replaced.
+    """
+    if action_mask is None:
+        return video_x
+    if projection_provider is None:
+        raise ValueError(
+            "Modality carries an action_mask but the model has no action stream. "
+            "Build the transformer with action_channels set."
+        )
+    action_in = projection_provider()
+    if action_in is None:
+        raise ValueError(
+            "Modality carries an action_mask but action_in is unmaterialized -- the checkpoint "
+            "supplied no weights for it."
+        )
+    action_x = action_in(latent[..., : action_in.in_features])
+    return torch.where(action_mask.unsqueeze(-1), action_x.to(dtype=video_x.dtype), video_x)
+
+
 @dataclass(frozen=True)
 class TransformerArgs:
     x: torch.Tensor
@@ -68,6 +117,10 @@ class TransformerArgs:
     self_attn_all_perturbed: bool = False
     cross_attn_perturbation_mask: torch.Tensor | None = None
     cross_attn_skip_all: bool = False
+    # Carried through the block loop so the output stage knows which positions of ``x`` are
+    # action tokens and must leave through ``action_out`` rather than ``proj_out``. ``(B, T)``
+    # boolean, or ``None`` for a sequence with no action tokens.
+    action_mask: torch.Tensor | None = None
 
 
 class BlockPerturbationsProcessor:
@@ -155,8 +208,13 @@ class TransformerArgsPreprocessor:
         caption_projection: torch.nn.Module | None = None,
         prompt_adaln: AdaLayerNormSingle | None = None,
         keyframes_embedding_provider: KeyframesEmbeddingProvider | None = None,
+        action_projection_provider: ActionProjectionProvider | None = None,
     ) -> None:
         self.patchify_proj = patchify_proj
+        # Resolved per call rather than captured, for the same reason as the keyframe embedding:
+        # these parameters are absent from checkpoints that predate the WAM, so they are built on
+        # the meta device and the parameter objects are replaced when materialized.
+        self.action_projection_provider = action_projection_provider
         self.adaln = adaln
         self.inner_dim = inner_dim
         self.max_pos = max_pos
@@ -267,6 +325,9 @@ class TransformerArgsPreprocessor:
     ) -> TransformerArgs:
         x = self.patchify_proj(modality.latent)
         x = apply_keyframes_absolute_embedding(x, modality.keyframes_mask, self.keyframes_embedding_provider)
+        # Action positions overwrite whatever patchify_proj produced for them; the keyframe
+        # marker is a video-patch concept and is discarded along with it.
+        x = apply_action_projection(x, modality.latent, modality.action_mask, self.action_projection_provider)
         batch_size = x.shape[0]
         timestep, embedded_timestep = self._prepare_timestep(
             modality.timesteps, self.adaln, batch_size, modality.latent.dtype
@@ -300,6 +361,7 @@ class TransformerArgsPreprocessor:
             enabled=modality.enabled,
             prompt_timestep=prompt_timestep,
             self_attention_mask=self_attention_mask,
+            action_mask=modality.action_mask,
         )
 
 
@@ -324,6 +386,7 @@ class MultiModalTransformerArgsPreprocessor:
         caption_projection: torch.nn.Module | None = None,
         prompt_adaln: AdaLayerNormSingle | None = None,
         keyframes_embedding_provider: KeyframesEmbeddingProvider | None = None,
+        action_projection_provider: ActionProjectionProvider | None = None,
     ) -> None:
         self.simple_preprocessor = TransformerArgsPreprocessor(
             patchify_proj=patchify_proj,
@@ -339,6 +402,7 @@ class MultiModalTransformerArgsPreprocessor:
             caption_projection=caption_projection,
             prompt_adaln=prompt_adaln,
             keyframes_embedding_provider=keyframes_embedding_provider,
+            action_projection_provider=action_projection_provider,
         )
         self.cross_scale_shift_adaln = cross_scale_shift_adaln
         self.cross_gate_adaln = cross_gate_adaln

@@ -142,6 +142,30 @@ class ModalityConfig(BaseModel):
     )
 
 
+class ActionConfig(BaseModel):
+    """Configuration for the WAM robot-action stream.
+
+    Actions are not a third modality. One action token per 15 Hz step is interleaved into the
+    video sequence in timestamp order, sharing its noise level, RoPE clock and self-attention.
+    They enter and leave the transformer through ``action_in`` / ``action_out`` rather than
+    ``patchify_proj`` / ``proj_out``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    latents_dir: str = Field(
+        ...,
+        description="Directory holding the action VAE latents, one (num_actions, action_channels) array per clip.",
+    )
+
+    loss_weight: float = Field(
+        5.0,
+        gt=0,
+        description="Lambda on the action loss term. Action tokens are ~0.7% of the sequence, so "
+        "an unweighted sum buries them. Swept 1 / 5 / 10 / 20.",
+    )
+
+
 class FlexibleStrategyConfig(TrainingStrategyConfigBase):
     """Configuration for the flexible training strategy.
     This strategy supports all conditioning scenarios through configuration:
@@ -161,6 +185,20 @@ class FlexibleStrategyConfig(TrainingStrategyConfigBase):
         default=None,
         description="Audio modality configuration",
     )
+
+    action: ActionConfig | None = Field(
+        default=None,
+        description="WAM action stream, interleaved into the video sequence. None = no actions.",
+    )
+
+    @model_validator(mode="after")
+    def validate_action_requires_generated_video(self) -> "FlexibleStrategyConfig":
+        """Actions ride inside the video sequence, so that sequence has to exist and be denoised."""
+        if self.action is None:
+            return self
+        if self.video is None or not self.video.is_generated:
+            raise ValueError("action requires a video modality with is_generated=true")
+        return self
 
     @model_validator(mode="after")
     def validate_at_least_one_generated(self) -> "FlexibleStrategyConfig":
@@ -195,6 +233,8 @@ class FlexibleStrategyConfig(TrainingStrategyConfigBase):
             sources[self.video.latents_dir] = "video_latents"
         if self.audio is not None:
             sources[self.audio.latents_dir] = "audio_latents"
+        if self.action is not None:
+            sources[self.action.latents_dir] = "action_latents"
 
         for modality_config in (self.video, self.audio):
             if modality_config is None:
@@ -220,6 +260,8 @@ class ModalityProcessingResult:
     modality: Modality
     targets: Tensor | None
     loss_mask: Tensor | None
+    # WAM: (B, T) True on the interleaved action tokens. None when there are none.
+    action_mask: Tensor | None = None
 
 
 @dataclass
@@ -273,6 +315,9 @@ class FlexibleStrategy(TrainingStrategy):
             audio_targets=audio_result.targets if audio_result else None,
             video_loss_mask=video_result.loss_mask if video_result else None,
             audio_loss_mask=audio_result.loss_mask if audio_result else None,
+            video_action_mask=video_result.action_mask if video_result else None,
+            action_loss_weight=self.config.action.loss_weight if self.config.action else 1.0,
+            action_channels=batch["action_latents"].shape[-1] if self.config.action else 0,
         )
 
     def compute_loss(
@@ -281,15 +326,41 @@ class FlexibleStrategy(TrainingStrategy):
         audio_pred: Tensor | None,
         inputs: ModelInputs,
     ) -> Tensor:
-        """Compute masked MSE loss for video and audio predictions. Returns [B,]."""
+        """Compute masked MSE loss for video and audio predictions. Returns [B,].
+
+        With the WAM action stream the video sequence carries two kinds of token, so the video
+        term splits in two: ``video_mse + lambda * action_mse``. The action term is restricted to
+        the action tokens *and* to the leading ``action_channels``, since the rest of an action
+        row is zero padding. Both components are recorded on ``self.last_loss_components`` so the
+        trainer can log them separately -- the plan calls for that from the start, since lambda
+        is unreadable otherwise.
+        """
         total_loss = None
+        self.last_loss_components: dict[str, Tensor] = {}
 
         if video_pred is not None and inputs.video_targets is not None:
-            video_loss = self._compute_modality_loss(
-                pred=video_pred,
-                targets=inputs.video_targets,
-                loss_mask=inputs.video_loss_mask,
-            )
+            action_mask = inputs.video_action_mask
+            if action_mask is None:
+                video_loss = self._compute_modality_loss(
+                    pred=video_pred,
+                    targets=inputs.video_targets,
+                    loss_mask=inputs.video_loss_mask,
+                )
+            else:
+                channels = inputs.action_channels
+                video_loss = self._compute_modality_loss(
+                    pred=video_pred,
+                    targets=inputs.video_targets,
+                    loss_mask=inputs.video_loss_mask & ~action_mask,
+                )
+                action_loss = self._compute_modality_loss(
+                    pred=video_pred[..., :channels],
+                    targets=inputs.video_targets[..., :channels],
+                    loss_mask=inputs.video_loss_mask & action_mask,
+                )
+                self.last_loss_components["video_loss"] = video_loss.detach()
+                self.last_loss_components["action_loss"] = action_loss.detach()
+                video_loss = video_loss + inputs.action_loss_weight * action_loss
             total_loss = video_loss
 
         if audio_pred is not None and inputs.audio_targets is not None:
@@ -428,6 +499,21 @@ class FlexibleStrategy(TrainingStrategy):
                     modality_key=modality_key,
                 )
 
+        # Step 5b: Interleave the WAM action tokens into the video sequence
+        action_mask = None
+        if modality_key == "video" and self.config.action is not None:
+            noisy_latents, targets, timesteps, loss_mask, positions, action_mask = self._interleave_action_tokens(
+                action_latents=batch["action_latents"],
+                noisy_latents=noisy_latents,
+                targets=targets,
+                timesteps=timesteps,
+                loss_mask=loss_mask,
+                positions=positions,
+                sigmas=sigmas,
+                num_frames=data.num_frames,
+                fps=data.fps,
+            )
+
         # Step 6: Build Modality
         modality = Modality(
             enabled=True,
@@ -437,12 +523,142 @@ class FlexibleStrategy(TrainingStrategy):
             positions=positions,
             context=prompt_embeds,
             context_mask=prompt_attention_mask,
+            action_mask=action_mask,
         )
 
         return ModalityProcessingResult(
             modality=modality,
             targets=targets,
             loss_mask=loss_mask,
+            action_mask=action_mask,
+        )
+
+    def _interleave_action_tokens(  # noqa: PLR0913
+        self,
+        action_latents: Tensor,
+        noisy_latents: Tensor,
+        targets: Tensor,
+        timesteps: Tensor,
+        loss_mask: Tensor,
+        positions: Tensor,
+        sigmas: Tensor,
+        num_frames: int,
+        fps: float,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+        """Splice the action tokens into the video sequence in timestamp order.
+
+        Action ``k`` is the transition from pixel frame ``k`` to ``k+1``, so its RoPE time is
+        ``k / fps`` and the frame it *produces* is ``k+1``. Each action token is placed
+        immediately after the video tokens of the latent frame holding the pixel frame it
+        produces -- grouping by destination rather than by source, matching how the windows were
+        cut in ``build_ltx_manifest.py``.
+
+        With the causal VAE, latent frame 0 holds pixel frame 0 alone and latent frame ``f >= 1``
+        holds pixels ``S(f-1)+1 .. Sf`` for a temporal scale ``S`` of 8. So latent frame 0 -- the
+        conditioning frame, clean and excluded from the loss -- carries no action, nothing having
+        been predicted for it, and every later frame carries the ``S`` actions that produced its
+        ``S`` pixel frames. A 25-frame window lays out as::
+
+            880 video | 880 video | 8 actions | 880 video | 8 | 880 video | 8
+
+        Under bidirectional attention the placement is cosmetic -- RoPE carries the time and
+        attention is permutation-invariant. It matters only if attention is later made causal,
+        which is why the order follows the clock rather than appending at the tail.
+
+        Action latents are zero-padded from ``action_channels`` out to the video channel count so
+        the sequence stays a single tensor. They take the *same* sigma as the video tokens
+        (shared noise level, per the plan), and the padded channels are noised along with the
+        rest -- the loss ignores them via ``ModelInputs.action_channels``.
+
+        Args:
+            action_latents: ``(B, n_actions, action_channels)`` from the frozen action VAE.
+            noisy_latents / targets / timesteps / loss_mask / positions: the video sequence.
+            sigmas: ``(B,)`` noise level, reused for the action tokens.
+            num_frames: number of latent frames in the video sequence.
+            fps: the video's frame rate; the action clock has to be the same one.
+
+        Returns:
+            ``(noisy_latents, targets, timesteps, loss_mask, positions, action_mask)`` -- the five
+            video tensors with the action rows spliced in at their timestamp positions, so ``T``
+            grows from 3520 to 3544, plus the new ``(B, T)`` boolean marking which rows those are.
+
+        Raises:
+            ValueError: if the video modality is conditioning-only, which leaves ``targets`` and
+                ``loss_mask`` unset. ``FlexibleStrategyConfig`` already rejects that combination;
+                this is the same requirement stated where the code depends on it.
+        """
+        if targets is None or loss_mask is None:
+            raise ValueError(
+                "action interleaving requires a generated video modality: a conditioning-only one "
+                "has no targets or loss mask to splice into"
+            )
+        batch_size, seq_len, channels = noisy_latents.shape
+        num_actions = action_latents.shape[1]
+        action_channels = action_latents.shape[2]
+        device, dtype = noisy_latents.device, noisy_latents.dtype
+
+        if seq_len % num_frames:
+            raise ValueError(f"video sequence length {seq_len} is not divisible by {num_frames} latent frames")
+        tokens_per_frame = seq_len // num_frames
+        temporal_scale = int(self.video_scale_factors.time)
+
+        # Pad the action latents out to the video channel count.
+        padded = torch.zeros(batch_size, num_actions, channels, device=device, dtype=dtype)
+        padded[..., :action_channels] = action_latents.to(device=device, dtype=dtype)
+
+        # Same noise level as the video tokens, and the same velocity target.
+        noise = torch.randn_like(padded)
+        sigmas_expanded = sigmas.view(-1, 1, 1)
+        noisy_actions = (1 - sigmas_expanded) * padded + sigmas_expanded * noise
+        action_targets = noise - padded
+        action_timesteps = sigmas.view(-1, 1).expand(batch_size, num_actions).clone()
+        action_loss_mask = torch.ones(batch_size, num_actions, dtype=torch.bool, device=device)
+
+        # Positions: time is exactly k / fps, and actions have no spatial extent. The last axis
+        # holds [start, end) bounds and RoPE reads their midpoint, so zero-width bounds put the
+        # token at k / fps rather than half a frame later.
+        times = (torch.arange(num_actions, device=device, dtype=torch.float32) / fps).view(1, 1, num_actions, 1)
+        action_positions = torch.zeros(batch_size, 3, num_actions, 2, device=device, dtype=torch.float32)
+        action_positions[:, 0] = times.expand(batch_size, 1, num_actions, 2)[:, 0]
+
+        # Which latent frame each action belongs to: the one holding the pixel frame it produces.
+        groups = [k // temporal_scale + 1 for k in range(num_actions)]
+        if groups and groups[-1] >= num_frames:
+            raise ValueError(
+                f"{num_actions} actions at temporal scale {temporal_scale} need "
+                f"{groups[-1] + 1} latent frames but the video has {num_frames}"
+            )
+
+        latent_parts, target_parts, timestep_parts, mask_parts, position_parts, flag_parts = [], [], [], [], [], []
+        cursor = 0
+        for frame in range(num_frames):
+            start, end = frame * tokens_per_frame, (frame + 1) * tokens_per_frame
+            latent_parts.append(noisy_latents[:, start:end])
+            timestep_parts.append(timesteps[:, start:end])
+            position_parts.append(positions[:, :, start:end])
+            flag_parts.append(torch.zeros(batch_size, tokens_per_frame, dtype=torch.bool, device=device))
+            target_parts.append(targets[:, start:end])
+            mask_parts.append(loss_mask[:, start:end])
+
+            count = sum(1 for g in groups if g == frame)
+            if not count:
+                continue
+            stop = cursor + count
+            latent_parts.append(noisy_actions[:, cursor:stop])
+            timestep_parts.append(action_timesteps[:, cursor:stop])
+            position_parts.append(action_positions[:, :, cursor:stop])
+            flag_parts.append(torch.ones(batch_size, count, dtype=torch.bool, device=device))
+            target_parts.append(action_targets[:, cursor:stop])
+            mask_parts.append(action_loss_mask[:, cursor:stop])
+            cursor = stop
+
+        return (
+            torch.cat(latent_parts, dim=1),
+            torch.cat(target_parts, dim=1),
+            torch.cat(timestep_parts, dim=1),
+            torch.cat(mask_parts, dim=1),
+            torch.cat(position_parts, dim=2),
+            torch.cat(flag_parts, dim=1),
         )
 
     @staticmethod

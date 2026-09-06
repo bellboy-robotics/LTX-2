@@ -61,6 +61,19 @@ class ModelInputs:
     video_loss_mask: Tensor | None
     audio_loss_mask: Tensor | None
 
+    # WAM: which tokens of the video sequence are robot actions rather than video patches.
+    # Action tokens are interleaved into the video stream, so they arrive inside
+    # ``video_targets`` and ``video_loss_mask``; this mask is what separates the two losses.
+    # ``None`` for every non-WAM run.
+    video_action_mask: Tensor | None = None
+    # Weight on the action term. Action tokens are ~0.7% of the sequence, so an unweighted sum
+    # would bury them.
+    action_loss_weight: float = 1.0
+    # How many leading channels of an action token's row carry the action VAE's latent. The rest
+    # is zero padding, present only so the sequence stays one tensor, and is excluded from the
+    # action loss.
+    action_channels: int = 0
+
 
 class TrainingStrategy(ABC):
     """Abstract base class for training strategies.

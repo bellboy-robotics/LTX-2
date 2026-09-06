@@ -475,11 +475,81 @@ class LtxvTrainer:
             lora_alpha=self._config.lora.alpha,
             target_modules=self._config.lora.target_modules,
             lora_dropout=self._config.lora.dropout,
+            modules_to_save=self._config.lora.modules_to_save or None,
             init_lora_weights=True,
         )
         # Wrap the transformer with PEFT to add LoRA layers
         # noinspection PyTypeChecker
         self._transformer = get_peft_model(self._transformer, lora_config)
+        self._unfreeze_extra_params()
+
+    def _unfreeze_extra_params(self) -> None:
+        """Make ``lora.extra_trainable_params`` trainable after PEFT has frozen everything.
+
+        ``modules_to_save`` covers whole modules, so it cannot reach a bare ``nn.Parameter`` such
+        as the WAM's ``action_scale_shift_table``. PEFT sets ``requires_grad=False`` on every base
+        parameter when it wraps the model, so this runs afterwards and turns the named ones back
+        on. ``_save_checkpoint`` writes them into the adapter file, since
+        ``get_peft_model_state_dict`` would otherwise drop them.
+        """
+        patterns = self._config.lora.extra_trainable_params
+        if not patterns:
+            return
+        matched = []
+        for name, param in self._transformer.named_parameters():
+            if any(pattern in name for pattern in patterns):
+                param.requires_grad_(True)
+                matched.append(name)
+        if not matched:
+            raise ValueError(
+                f"lora.extra_trainable_params={patterns} matched no parameter. "
+                "Check the names against the model, or drop the setting."
+            )
+        logger.info("Training %d extra parameter tensors outside LoRA: %s", len(matched), ", ".join(matched))
+
+    def _extra_trainable_state(self, state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
+        """Pick the ``extra_trainable_params`` tensors out of an already-gathered state dict.
+
+        Filtering the gathered dict rather than reading ``named_parameters()`` is deliberate:
+        under FSDP the live parameters are shards, and only the dict returned by
+        ``Accelerator.get_state_dict`` holds the whole tensors.
+
+        PEFT prefixes every base parameter with ``base_model.model.``; that is stripped so the
+        keys line up with the rest of the saved adapter.
+        """
+        patterns = self._config.lora.extra_trainable_params
+        if not patterns:
+            return {}
+        return {
+            key.replace("base_model.model.", "", 1): value
+            for key, value in state_dict.items()
+            if any(pattern in key for pattern in patterns)
+        }
+
+    def _load_extra_trainable_state(self, state_dict: dict[str, Tensor]) -> None:
+        """Restore the ``extra_trainable_params`` tensors from a checkpoint.
+
+        ``set_peft_model_state_dict`` only knows about adapter weights and silently drops
+        everything else, so without this a resumed run would reset these parameters to their
+        initial values and lose the training they had.
+        """
+        patterns = self._config.lora.extra_trainable_params
+        if not patterns:
+            return
+        unwrapped = self._accelerator.unwrap_model(self._transformer, keep_torch_compile=False)
+        by_name = dict(unwrapped.named_parameters())
+        restored = 0
+        for key, value in state_dict.items():
+            if not any(pattern in key for pattern in patterns):
+                continue
+            param = by_name.get(key) or by_name.get(f"base_model.model.{key}")
+            if param is None:
+                logger.warning("Checkpoint holds '%s' but the model has no such parameter", key)
+                continue
+            with torch.no_grad():
+                param.copy_(value.to(device=param.device, dtype=param.dtype))
+            restored += 1
+        logger.info("Restored %d extra trainable parameter tensors from the checkpoint", restored)
 
     def _load_checkpoint(self) -> None:
         """Load checkpoint if specified in config, then resolve resume state."""
@@ -521,6 +591,7 @@ class LtxvTrainer:
         # Load LoRA weights and verify all weights were loaded
         base_model = self._transformer.get_base_model()
         set_peft_model_state_dict(base_model, state_dict)
+        self._load_extra_trainable_state(state_dict)
 
         logger.info("✅ LoRA checkpoint loaded successfully")
 
@@ -958,11 +1029,18 @@ class LtxvTrainer:
         # For LoRA: extract only adapter weights; for full: use as-is
         if is_lora:
             unwrapped = self._accelerator.unwrap_model(self._transformer, keep_torch_compile=False)
+            # Bare nn.Parameters unfrozen via extra_trainable_params are not adapter weights, so
+            # get_peft_model_state_dict drops them. Captured here, while the full gathered dict is
+            # still in hand. Without this the WAM's action_scale_shift_table would train and then
+            # be discarded at every checkpoint.
+            extra_state = self._extra_trainable_state(state_dict)
+
             # For FSDP, pass the gathered state dict since model params aren't directly accessible
             state_dict = get_peft_model_state_dict(unwrapped, state_dict=state_dict if is_fsdp else None)
 
             # Remove "base_model.model." prefix added by PEFT
             state_dict = {k.replace("base_model.model.", "", 1): v for k, v in state_dict.items()}
+            state_dict.update(extra_state)
 
             # Convert to ComfyUI-compatible format (add "diffusion_model." prefix)
             state_dict = {f"diffusion_model.{k}": v for k, v in state_dict.items()}
