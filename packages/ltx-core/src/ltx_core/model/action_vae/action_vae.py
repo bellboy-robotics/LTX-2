@@ -6,6 +6,15 @@ and frozen for the WAM finetune; only ``action_in`` / ``action_out`` (the projec
 from the DiT width) are trained during the finetune, so the latent width is chosen for the
 health of the VAE itself, not to match anything in the transformer.
 
+The defaults -- latent 7, hidden 64, 2 layers -- are the settled configuration; the sweep that
+produced them, and the reasoning for beta, are recorded in ``scripts/train_action_vae.py``.
+Latent 7 is the data's intrinsic dimensionality: exactly 7 channels stay active whatever width
+the model is given, and PCA on the normalized actions confirms full rank 7.
+
+``action_in`` on the transformer side is a single ``Linear``, matching how LTX's video and audio
+streams enter through ``patchify_proj`` and ``audio_patchify_proj``. There is no modality marker
+-- see ``LTXModel._init_action`` for why one would be redundant.
+
 Contract, identical to ``VideoEncoder`` and ``AudioEncoder``:
   * ``ActionEncoder.forward`` returns *normalized posterior means only*. The log-variance is
     a training-time quantity and is discarded at inference.
@@ -46,7 +55,7 @@ class ActionEncoder(nn.Module, Disposable):
     def __init__(
         self,
         action_dim: int = 7,
-        latent_channels: int = 8,
+        latent_channels: int = 7,
         hidden: int = 64,
         num_layers: int = 2,
     ):
@@ -85,7 +94,7 @@ class ActionDecoder(nn.Module, Disposable):
     def __init__(
         self,
         action_dim: int = 7,
-        latent_channels: int = 8,
+        latent_channels: int = 7,
         hidden: int = 64,
         num_layers: int = 2,
     ):

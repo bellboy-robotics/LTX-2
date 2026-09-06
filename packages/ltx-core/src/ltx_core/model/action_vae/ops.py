@@ -21,7 +21,7 @@ class PerChannelStatistics(nn.Module):
     ``(B, T, C)`` rather than ``(B, C, F, H, W)``, so the broadcast view is ``(1, 1, -1)``.
     """
 
-    def __init__(self, latent_channels: int = 8):
+    def __init__(self, latent_channels: int = 7):
         super().__init__()
         self.register_buffer("std-of-means", torch.ones(latent_channels))
         self.register_buffer("mean-of-means", torch.zeros(latent_channels))

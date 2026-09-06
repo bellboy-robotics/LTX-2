@@ -14,16 +14,30 @@ the same way the video VAE divides pixels by 255 rather than by a dataset statis
 Reduction convention -- this is what makes ``--kl-weight`` mean something:
     reconstruction = squared error SUMMED over the action dimensions, averaged over samples
     kl            = KL SUMMED over the latent dimensions, averaged over samples
-so ``loss = recon + beta * kl`` with ``beta = 2 * sigma_obs^2``. beta=1e-2 therefore asserts a
-reconstruction noise of sigma ~= 0.07 in normalized units (7% of the half-range). Sweep beta
-against the reported error in raw units rather than trusting that.
+so ``loss = recon + beta * kl`` with ``beta = 2 * sigma_obs^2``. Do not trust that as a way to
+pick beta -- sweep it against the reported error in raw units.
+
+Defaults are the settled configuration, chosen from a 24-run sweep over latent width, beta and
+hidden width:
+
+* **latent 7.** Exactly 7 dimensions stayed active at every beta below 1e-2 and at every latent
+  width tried (7, 8, 16) -- dead dimensions read exactly 0.000 nats, so the count is not an
+  artifact of a threshold. PCA on the normalized actions confirms full rank 7 (smallest
+  correlation eigenvalue 0.30). Wider latents carry inert channels whose whitening std is
+  degenerate.
+* **beta 3e-5.** Held-out error falls 0.209 -> 0.064 -> 0.039 mm across 3e-4 / 1e-4 / 3e-5, then
+  rises again at 1e-5. 3e-5 is the floor. This is far from a KL-dominated regime by the
+  standards of the field -- LDM's AutoencoderKL uses 1e-6 -- and information the VAE discards
+  cannot be recovered by anything downstream, whereas distribution mismatch can be, since
+  ``action_in`` and the LoRA adapters are trained.
+* **hidden 64, 2 layers.** No measured benefit from 128. Three seeds at the chosen config gave
+  0.064 +/- 0.011 mm, a ~17% spread that swamps every width difference observed.
 
 Example:
     python scripts/train_action_vae.py \
         --dataset /mnt/filestore/hf-cache/lerobot/bellboy-robotics/TD-WAM-720p-8tasks \
         --held-out-episodes held_out.txt \
-        --latent-channels 8 --hidden 64 --kl-weight 1e-2 \
-        --out runs/action_vae_l8_b1e-2
+        --out runs/action_vae_l7_b3e-5
 """
 
 from __future__ import annotations
@@ -64,10 +78,10 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--held-out-frac", type=float, default=0.02, help="Used only if --held-out-episodes is absent.")
 
-    p.add_argument("--latent-channels", type=int, default=8)
+    p.add_argument("--latent-channels", type=int, default=7)
     p.add_argument("--hidden", type=int, default=64)
     p.add_argument("--num-layers", type=int, default=2)
-    p.add_argument("--kl-weight", type=float, default=1e-2)
+    p.add_argument("--kl-weight", type=float, default=3e-5)
     p.add_argument(
         "--gripper-range",
         type=float,
