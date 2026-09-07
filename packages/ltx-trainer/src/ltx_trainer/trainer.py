@@ -409,6 +409,35 @@ class LtxvTrainer:
 
         return TrainingStepOutput(loss=loss, sigma=sigma)
 
+    def _enable_action_tokens(self) -> None:
+        """Give the loaded transformer its WAM action stream, when the strategy trains one.
+
+        The pretrained checkpoint has no action stream: ``LTXModelConfigurator`` builds the model
+        from the checkpoint's own config, which knows nothing about actions, so ``action_in``,
+        ``action_out`` and ``action_scale_shift_table`` do not exist until this runs. It has to
+        run before ``_collect_trainable_params``, since that is where LoRA wraps the model and
+        where ``modules_to_save`` and ``extra_trainable_params`` look for these by name.
+
+        The channel count is read from a precomputed action latent rather than configured. It has
+        to equal the action VAE's latent width, the precompute already wrote exactly that, and a
+        config field would be one more number that can silently disagree with the data.
+        """
+        action_config = getattr(self._config.training_strategy, "action", None)
+        if action_config is None:
+            return
+
+        directory = Path(self._config.data.preprocessed_data_root) / action_config.latents_dir
+        sample = next(directory.rglob("*.pt"), None)
+        if sample is None:
+            raise FileNotFoundError(
+                f"no action latents under {directory}. Run scripts/process_actions.py, or drop "
+                "training_strategy.action."
+            )
+        channels = int(torch.load(sample, map_location="cpu", weights_only=True).shape[-1])
+
+        self._transformer.enable_action_tokens(action_channels=channels)
+        logger.info(f"🦾 Action stream enabled: {channels} channels, read from {sample.name}")
+
     def _load_models(self) -> None:
         """Load the transformer and embeddings processor for training."""
         logger.debug("Loading transformer...")
@@ -417,6 +446,7 @@ class LtxvTrainer:
             device="cpu",
             dtype=torch.bfloat16,
         )
+        self._enable_action_tokens()
 
         # DDP-safe: LOCAL_RANK is set by accelerate before trainer init. Loading on bare
         # "cuda" would resolve to cuda:0 on every rank and crash with a device mismatch.

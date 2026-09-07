@@ -116,7 +116,7 @@ class LTXModel(torch.nn.Module, Disposable):
             # WAM: action tokens ride inside the video stream, so this depends on inner_dim
             # and must follow _init_video.
             if action_channels:
-                self._init_action(action_channels=action_channels)
+                self.enable_action_tokens(action_channels=action_channels)
 
         if model_type.is_audio_enabled():
             if audio_positional_embedding_max_pos is None:
@@ -236,8 +236,13 @@ class LTXModel(torch.nn.Module, Disposable):
         self.norm_out = torch.nn.LayerNorm(self.inner_dim, elementwise_affine=False, eps=norm_eps)
         self.proj_out = torch.nn.Linear(self.inner_dim, out_channels)
 
-    def _init_action(self, action_channels: int) -> None:
+    def enable_action_tokens(self, action_channels: int) -> None:
         """Initialize the WAM action stream.
+
+        Public because the pretrained checkpoint has no action stream: its metadata carries no
+        ``action_channels``, so the configurator builds the model without one and the trainer
+        turns it on afterwards, before LoRA wraps the model. Calling it twice would discard the
+        first set of weights, so it refuses.
 
         Action tokens are interleaved into the video sequence -- they share its self-attention,
         timesteps and RoPE clock -- but get their own entry and exit projections, because
@@ -267,10 +272,28 @@ class LTXModel(torch.nn.Module, Disposable):
         which marks a *subset* of tokens that otherwise share ``patchify_proj``, so there the
         marker is the only thing distinguishing them.
         """
+        if getattr(self, "action_channels", 0):
+            raise ValueError(
+                f"this model already has an action stream with {self.action_channels} channels; "
+                "enabling it again would throw away the weights it holds"
+            )
+        if action_channels < 1:
+            raise ValueError(f"action_channels must be positive, got {action_channels}")
+
+        # Match whatever the video stream is in. When this runs after loading, the model is
+        # bfloat16 and a default float32 Linear would break the first matmul; when it runs from
+        # the constructor, patchify_proj carries the dtype ``ops`` just built it with.
+        reference = self.patchify_proj.weight
         self.action_channels = action_channels
-        self.action_in = torch.nn.Linear(action_channels, self.inner_dim, bias=True)
-        self.action_out = torch.nn.Linear(self.inner_dim, action_channels)
-        self.action_scale_shift_table = torch.nn.Parameter(torch.zeros(2, self.inner_dim))
+        self.action_in = torch.nn.Linear(
+            action_channels, self.inner_dim, bias=True, device=reference.device, dtype=reference.dtype
+        )
+        self.action_out = torch.nn.Linear(
+            self.inner_dim, action_channels, device=reference.device, dtype=reference.dtype
+        )
+        self.action_scale_shift_table = torch.nn.Parameter(
+            torch.zeros(2, self.inner_dim, device=reference.device, dtype=reference.dtype)
+        )
 
     def _action_projection(self) -> torch.nn.Linear | None:
         """Resolve the action entry projection, or ``None`` when this model has no action stream.
@@ -537,7 +560,7 @@ class LTXModel(torch.nn.Module, Disposable):
         Where ``action_mask`` is True the token is a WAM action rather than a video patch. Action
         tokens share ``norm_out``, which has no parameters, but take their own scale-shift
         modulation from ``action_scale_shift_table`` and leave through ``action_out`` instead of
-        ``proj_out``. See ``_init_action`` for why the scale row cannot be folded into
+        ``proj_out``. See ``enable_action_tokens`` for why the scale row cannot be folded into
         ``action_out`` while the shift row can.
 
         Because the action tokens are interleaved rather than contiguous, both modulations and
