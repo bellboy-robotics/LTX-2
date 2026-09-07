@@ -11,6 +11,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 from einops import rearrange
 from torch import Tensor
@@ -18,6 +19,7 @@ from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as TF  # noqa: N812
 from torchvision.transforms.functional import to_tensor
 
+from ltx_core.action_layout import ActionTokenLayout, WamVideoLatentTools, add_action_slots
 from ltx_core.components.diffusion_steps import EulerDiffusionStep
 from ltx_core.components.guiders import MultiModalGuider, MultiModalGuiderParams
 from ltx_core.components.noisers import GaussianNoiser
@@ -35,6 +37,7 @@ from ltx_core.guidance.perturbations import (
     PerturbationType,
 )
 from ltx_core.loader import SafetensorsModelStateDictLoader
+from ltx_core.model.action_vae.loading import load_action_decoder
 from ltx_core.model.audio_vae.audio_vae import encode_audio as ltx_encode_audio
 from ltx_core.model.transformer.modality import Modality
 from ltx_core.model.transformer.model import X0Model
@@ -177,9 +180,79 @@ class ValidationRunner:
         self._cached_media = self._encode_conditioning_media()
         self._load_decoder_components()
 
+        # WAM action scoring. The decoder is a two-layer MLP -- kilobytes -- so unlike the video
+        # decoders it just stays loaded on the CPU. Ground truth is read once here rather than at
+        # every validation step: a missing or misshapen file should stop the run at startup, not
+        # after an hour of training.
+        self._action_decoder = None
+        self._action_truth: dict[int, Tensor] = {}
+        if self._config.action is not None:
+            self._action_decoder = load_action_decoder(self._config.action.action_vae)
+            self._action_truth = self._load_action_truth()
+
     def _audio_vae_path(self) -> str:
         """Resolve the file holding the audio VAE and vocoder, at the point one is needed."""
         return resolve_audio_vae_path(self._model_path, self._audio_vae_path_override)
+
+    def _load_action_truth(self) -> dict[int, Tensor]:
+        """Read each scored sample's ground-truth actions, keyed by sample index.
+
+        Every array must have the configured ``num_actions`` rows and the decoder's ``action_dim``
+        columns, because those two numbers also fix the sequence layout. A file that disagrees
+        would either fail to compare or, worse, compare against a shifted array.
+        """
+        action_config = self._config.action
+        assert action_config is not None and self._action_decoder is not None
+        expected = (action_config.num_actions, self._action_decoder.action_dim)
+
+        truth: dict[int, Tensor] = {}
+        for index, sample in enumerate(self._config.samples):
+            if sample.actions is None:
+                continue
+            path = Path(sample.actions)
+            if not path.is_file():
+                raise FileNotFoundError(f"validation sample {index}: no action array at {path}")
+            array = torch.from_numpy(np.load(path)).float()
+            if tuple(array.shape) != expected:
+                raise ValueError(
+                    f"validation sample {index}: action array at {path} has shape "
+                    f"{tuple(array.shape)}, expected {expected} "
+                    f"(num_actions x action_dim from validation.action and the VAE config)"
+                )
+            truth[index] = array
+        return truth
+
+    def action_layout(self) -> ActionTokenLayout | None:
+        """The action layout, or None when action scoring is off.
+
+        Public so the trainer can compare it against the layout the training data implies: the two
+        sequences are built by separate code paths and agree only if this object does.
+
+        There is exactly one. It comes from ``ValidationConfig.video_dims``, and the config
+        refuses a per-sample ``video_dims`` override on any sample carrying actions, so no sample
+        can run at a geometry this does not describe.
+        """
+        if self._config.action is None:
+            return None
+        width, height, frames = self._config.video_dims
+        return self._action_layout(self._create_video_tools(width, height, frames))
+
+    def _action_layout(self, tools: VideoLatentTools) -> ActionTokenLayout | None:
+        """The layout for a sequence built by ``tools``, or None when actions are off.
+
+        Derived from the tools rather than from the config so it cannot disagree with the sequence
+        it describes: the token count per latent frame and the number of latent frames both come
+        from the same ``target_shape`` the video tokens were built from.
+        """
+        if self._config.action is None:
+            return None
+        return ActionTokenLayout(
+            num_actions=self._config.action.num_actions,
+            num_frames=tools.target_shape.frames,
+            tokens_per_frame=tools.tokens_per_latent_frame,
+            temporal_scale=int(self._video_scale_factors.time),
+            fps=tools.fps,
+        )
 
     def _validate_sample_geometry(self) -> None:
         """Assert every validation sample's geometry is compatible with the VAE compression.
@@ -261,6 +334,7 @@ class ValidationRunner:
         samples_dir.mkdir(exist_ok=True, parents=True)
 
         results: list[tuple[int, Path]] = []
+        action_errors: list[Tensor] = []
 
         for local_i, (sample_idx, save_output) in enumerate(work_items):
             sample = samples[sample_idx]
@@ -269,7 +343,7 @@ class ValidationRunner:
             cached_embeddings = self._cached_embeddings[sample_idx] if self._cached_embeddings else None
             cached_media = self._cached_media[sample_idx] if self._cached_media else CachedSampleMedia()
 
-            video, audio = self._generate_sample(
+            video, audio, actions = self._generate_sample(
                 sample=sample,
                 cached_embeddings=cached_embeddings,
                 cached_media=cached_media,
@@ -280,6 +354,9 @@ class ValidationRunner:
 
             if not save_output:
                 continue
+
+            if actions is not None and sample_idx in self._action_truth:
+                action_errors.append(actions - self._action_truth[sample_idx])
 
             dims = sample.video_dims or self._config.video_dims
             num_frames = dims[2]
@@ -309,10 +386,47 @@ class ValidationRunner:
         rel_path = samples_dir.relative_to(output_dir)
         logger.info(f"🎥 Validation samples for step {step} saved in {rel_path}")
 
+        if action_errors:
+            self._report_action_error(torch.stack(action_errors), step, wandb_run)
+
         if wandb_run is not None and results:
             self.log_to_wandb(wandb_run, [p for _, p in results], step)
 
         return results
+
+    def _report_action_error(self, errors: Tensor, step: int, wandb_run: object | None) -> None:
+        """Log how far the generated actions fell from ground truth, in physical units.
+
+        Args:
+            errors: ``(samples, num_actions, action_dim)`` of signed generated-minus-true values.
+
+        Reported per dimension rather than as one number, because the dimensions are not
+        commensurable -- millimetres, radians and gripper counts do not average into anything.
+        Both the magnitude and the signed mean are logged: the magnitude is the error, the sign
+        says whether it cancels over a rollout or accumulates. These are per-step deltas, so a
+        small bias that always points the same way walks the gripper off target while the mean
+        absolute error still looks fine.
+
+        Under distributed validation each rank sees only its own samples, so this is a per-rank
+        report. With a handful of samples split across ranks that is usually the whole set on
+        rank 0; treat it as a trend line, not a precise dataset average.
+        """
+        absolute = errors.abs().mean(dim=(0, 1))
+        signed = errors.mean(dim=(0, 1))
+        names = ["dx", "dy", "dz", "rx", "ry", "rz", "gripper"][: absolute.numel()]
+
+        summary = ", ".join(f"{name} {value:.3f}" for name, value in zip(names, absolute.tolist(), strict=False))
+        logger.info(f"🦾 Action MAE at step {step} over {errors.shape[0]} samples (mm / rad / counts): {summary}")
+
+        if wandb_run is not None:
+            log = getattr(wandb_run, "log", None)
+            if callable(log):
+                metrics: dict[str, float] = {}
+                for name, value in zip(names, absolute.tolist(), strict=False):
+                    metrics[f"validation/action_mae_{name}"] = value
+                for name, value in zip(names, signed.tolist(), strict=False):
+                    metrics[f"validation/action_bias_{name}"] = value
+                log(metrics, step=step)
 
     # --- Initialization: caching ---
 
@@ -581,8 +695,12 @@ class ValidationRunner:
         transformer: "LTXModel",
         device: torch.device,
         sampling_ctx: SamplingContext,
-    ) -> tuple[Tensor | None, Tensor | None]:
-        """Generate one sample: build conditioned states, denoise, decode."""
+    ) -> tuple[Tensor | None, Tensor | None, Tensor | None]:
+        """Generate one sample: build conditioned states, denoise, decode.
+
+        Returns ``(video, audio, actions)``. The third is ``None`` unless action scoring is on;
+        when it is, it holds the generated actions decoded into physical units.
+        """
         dims = sample.video_dims or self._config.video_dims
         width, height, num_frames = dims
         seed = sample.seed or self._config.seed
@@ -603,6 +721,7 @@ class ValidationRunner:
         video_state: LatentState | None = None
         video_clean: LatentState | None = None
         video_tools: VideoLatentTools | None = None
+        action_layout: ActionTokenLayout | None = None
 
         if generate_video or video_frozen:
             video_tools = self._create_video_tools(width, height, num_frames)
@@ -621,6 +740,14 @@ class ValidationRunner:
             else:
                 video_state = video_tools.create_initial_state(device=device, dtype=torch.bfloat16)
                 video_state = self._apply_video_conditionings(video_state, video_tools, sample, cached_media, device)
+                # Action slots go in before ``video_clean`` is taken and before the noiser, so
+                # both see the full sequence: ``_post_process_latent`` indexes the clean latent
+                # with the state's denoise mask each step, and the two must be the same length.
+                # The slots carry ``denoise_mask = 1``, so the noiser fills them exactly as it
+                # fills the unconditioned video tokens -- no special case in the loop.
+                action_layout = self._action_layout(video_tools)
+                if action_layout is not None:
+                    video_state = add_action_slots(video_state, action_layout)
                 video_clean = video_state
                 video_state = noiser(video_state, noise_scale=1.0)
 
@@ -668,17 +795,24 @@ class ValidationRunner:
             a_ctx_neg=a_ctx_neg,
             device=device,
             sampling_ctx=sampling_ctx,
+            action_layout=action_layout,
         )
 
-        # 5. Decode modalities (both generated and frozen — frozen audio/video is included in output)
+        # 5. Read the generated actions out. A pure read, so it can happen here, before the video
+        # path removes those rows -- nothing is consumed and the state is unchanged.
+        action_output = None
+        if action_layout is not None and video_state is not None:
+            action_output = self._finalize_actions(action_layout.extract(video_state.latent, dim=1))
+
+        # 6. Decode modalities (both generated and frozen — frozen audio/video is included in output)
         video_output = self._finalize_modality(video_state, video_tools, self._decode_video, device)
         audio_output = self._finalize_modality(audio_state, audio_tools, self._decode_audio, device)
 
-        # 6. Side-by-side reference output
+        # 7. Side-by-side reference output
         if video_output is not None:
             video_output = self._apply_reference_side_by_side(video_output, sample, cached_media)
 
-        return video_output, audio_output
+        return video_output, audio_output, action_output
 
     # ------------------------------------------------------------------
     # Conditioning application
@@ -868,8 +1002,15 @@ class ValidationRunner:
         a_ctx_neg: Tensor | None,
         device: torch.device,
         sampling_ctx: SamplingContext,
+        action_layout: ActionTokenLayout | None = None,
     ) -> tuple[LatentState | None, LatentState | None]:
-        """Run the Euler denoising loop with CFG/STG, handling frozen modalities."""
+        """Run the Euler denoising loop with CFG/STG, handling frozen modalities.
+
+        ``action_layout`` marks which of the video sequence's tokens are actions, so the
+        transformer routes them through ``action_in`` / ``action_out`` instead of the video
+        projections. It changes nothing else: the guidance, the conditioning re-application and
+        the Euler step all treat those rows as ordinary generated tokens.
+        """
         # Under `accelerate launch` with >1 process, `transformer` is wrapped in DistributedDataParallel,
         # which forwards forward() but not custom attributes like `num_blocks`. Unwrap once here.
         base_transformer = getattr(transformer, "module", transformer)
@@ -894,6 +1035,13 @@ class ValidationRunner:
             )
         )
         transformer_dtype = next(transformer.parameters()).dtype
+        # Built once: the mask depends only on the layout, and the sequence length is fixed for
+        # the whole loop.
+        action_mask = (
+            None
+            if action_layout is None or video_state is None
+            else action_layout.mask(video_state.latent.shape[0], device)
+        )
 
         x0_model = X0Model(transformer)
 
@@ -902,7 +1050,7 @@ class ValidationRunner:
             a_sigma = torch.zeros_like(sigma) if audio_frozen else sigma
 
             video = (
-                self._modality_from_latent_state(video_state, v_ctx_pos, v_sigma.unsqueeze(0))
+                self._modality_from_latent_state(video_state, v_ctx_pos, v_sigma.unsqueeze(0), action_mask)
                 if video_state is not None
                 else None
             )
@@ -999,6 +1147,23 @@ class ValidationRunner:
         state = tools.clear_conditioning(state)
         state = tools.unpatchify(state)
         return decode_fn(state, device)
+
+    def _finalize_actions(self, action_tokens: Tensor) -> Tensor:
+        """Decode generated action tokens into physical units.
+
+        The action counterpart of :meth:`_finalize_modality`, and much shorter, because none of
+        that method's three steps apply: there is no grid to clear back to, nothing to unpatchify,
+        and the decoder is a two-layer MLP rather than a 3D conv net. Only the channel padding has
+        to come off -- the rows were widened to the video's channel count to live in one tensor,
+        and the extra columns carry nothing.
+
+        Returns:
+            ``(num_actions, action_dim)`` on the CPU, in the units the action VAE was fitted on:
+            millimetres, radians, and raw gripper counts.
+        """
+        assert self._action_decoder is not None
+        latents = action_tokens[..., : self._action_decoder.latent_channels].float().cpu()
+        return self._action_decoder(latents).squeeze(0)
 
     def _decode_video(self, video_state: LatentState, device: torch.device) -> Tensor:
         """Decode video latents to pixels using tiled VAE decoding."""
@@ -1164,17 +1329,28 @@ class ValidationRunner:
         return mask.unsqueeze(0)  # [1, num_tokens]
 
     def _create_video_tools(self, width: int, height: int, num_frames: int) -> VideoLatentTools:
-        """Create VideoLatentTools for the given output dimensions."""
+        """Create VideoLatentTools for the given output dimensions.
+
+        With action scoring on, returns the WAM subclass instead. Its only difference is that
+        ``clear_conditioning`` drops the action rows before the decode path sees the sequence --
+        that path reads the tokens as the patchified video grid, which interleaved action rows
+        are not. Doing it in the tools rather than at the call site means no decode can skip it.
+        """
         pixel_shape = VideoPixelShape(
             batch=1, frames=num_frames, height=height, width=width, fps=self._config.frame_rate
         )
-        return VideoLatentTools(
-            patchifier=self._video_patchifier,
-            target_shape=VideoLatentShape.from_pixel_shape(shape=pixel_shape, scale_factors=self._video_scale_factors),
-            fps=self._config.frame_rate,
-            scale_factors=self._video_scale_factors,
-            causal_fix=True,
-        )
+        fields = {
+            "patchifier": self._video_patchifier,
+            "target_shape": VideoLatentShape.from_pixel_shape(
+                shape=pixel_shape, scale_factors=self._video_scale_factors
+            ),
+            "fps": self._config.frame_rate,
+            "scale_factors": self._video_scale_factors,
+            "causal_fix": True,
+        }
+        tools = VideoLatentTools(**fields)
+        layout = self._action_layout(tools)
+        return tools if layout is None else WamVideoLatentTools(**fields, action_layout=layout)
 
     def _create_audio_tools(self, num_frames: int, frame_rate: float) -> AudioLatentTools:
         """Create AudioLatentTools for the given video duration."""
@@ -1261,7 +1437,9 @@ class ValidationRunner:
         )
 
     @staticmethod
-    def _modality_from_latent_state(state: LatentState, context: Tensor, sigma: Tensor) -> Modality:
+    def _modality_from_latent_state(
+        state: LatentState, context: Tensor, sigma: Tensor, action_mask: Tensor | None = None
+    ) -> Modality:
         """Build a Modality object from a LatentState, text context, and sigma."""
         if state.frozen:
             sigma = torch.zeros_like(sigma)
@@ -1274,6 +1452,7 @@ class ValidationRunner:
             context=context,
             context_mask=None,
             keyframes_mask=state.keyframes_mask,
+            action_mask=action_mask,
         )
 
     @staticmethod

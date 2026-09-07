@@ -31,6 +31,7 @@ from torch.optim.lr_scheduler import (
 )
 from torch.utils.data import DataLoader
 
+from ltx_core.action_layout import ActionTokenLayout
 from ltx_core.text_encoders.gemma import convert_to_additive_mask
 from ltx_trainer import logger
 from ltx_trainer.config import LtxTrainerConfig
@@ -51,6 +52,7 @@ from ltx_trainer.sigma_tracker import SigmaBucketTracker
 from ltx_trainer.timestep_samplers import SAMPLERS
 from ltx_trainer.training_state import ConfigFingerprint, RngStates, TrainingState
 from ltx_trainer.training_strategies import get_training_strategy
+from ltx_trainer.training_strategies.base_strategy import DEFAULT_FPS
 from ltx_trainer.validation_runner import ValidationRunner
 
 # Disable irrelevant warnings from transformers
@@ -751,6 +753,7 @@ class LtxvTrainer:
 
             self._dataset = PrecomputedDataset(self._config.data.preprocessed_data_root, data_sources=data_sources)
             logger.debug(f"Loaded dataset with {len(self._dataset):,} samples from sources: {list(data_sources)}")
+            self._check_action_layout_matches_validation()
 
         num_workers = self._config.data.num_dataloader_workers
         dataloader = DataLoader(
@@ -764,6 +767,56 @@ class LtxvTrainer:
         )
 
         self._dataloader = self._accelerator.prepare(dataloader)
+
+    def _check_action_layout_matches_validation(self) -> None:
+        """Fail at startup if validation would lay its action tokens out differently than training.
+
+        The two paths build their sequences separately -- the strategy from loose tensors, the
+        validation runner from a ``LatentState`` -- because LTX keeps those representations apart.
+        They agree only if they agree about the geometry, and a disagreement is invisible: the
+        shapes stay valid, the model runs, and the reported action error is simply measuring a
+        sequence the model was never trained on.
+
+        So the check compares the layouts as objects. Equality on the frozen dataclass covers
+        every field at once -- token count per latent frame (resolution), number of latent frames
+        (clip length), number of actions, temporal scale (how many actions ride with each frame)
+        and fps (the clock the action RoPE times are read off). The training side is read from a
+        precomputed sample rather than from config, so it is what training will actually do.
+        """
+        strategy = self._config.training_strategy
+        validation = self._config.validation
+        if getattr(strategy, "action", None) is None or validation is None or validation.action is None:
+            return
+        assert self._dataset is not None
+
+        sample = self._dataset[0]
+        latents = sample["video_latents"]
+        num_frames = int(latents["num_frames"])
+        height, width = int(latents["height"]), int(latents["width"])
+        training_layout = ActionTokenLayout.from_sequence(
+            num_actions=sample["action_latents"].shape[0],
+            num_frames=num_frames,
+            video_seq_len=num_frames * height * width,
+            temporal_scale=int(strategy.video_scale_factors.time),
+            fps=float(latents.get("fps", DEFAULT_FPS)),
+        )
+        validation_layout = self._validation_runner.action_layout()
+
+        if training_layout != validation_layout:
+            differences = "\n  ".join(
+                f"{field}: training {getattr(training_layout, field)}, "
+                f"validation {getattr(validation_layout, field)}"
+                for field in ("num_actions", "num_frames", "tokens_per_frame", "temporal_scale", "fps")
+                if getattr(training_layout, field) != getattr(validation_layout, field)
+            )
+            raise ValueError(
+                "validation would build a different action/video sequence than training:\n  "
+                f"{differences}\n"
+                "Training's numbers come from the precomputed data; validation's from "
+                "validation.video_dims, validation.frame_rate and the action VAE. Line them up, "
+                "or the action error will not mean anything."
+            )
+        logger.debug(f"Action layout agrees between training and validation: {training_layout}")
 
     def _init_lora_weights(self) -> None:
         """Initialize LoRA weights for the transformer."""

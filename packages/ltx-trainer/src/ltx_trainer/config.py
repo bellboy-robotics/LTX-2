@@ -183,6 +183,15 @@ class ValidationSample(ConfigBaseModel):
     prompt: str
     conditions: list[ValidationCondition] = Field(default_factory=list)
 
+    actions: str | None = Field(
+        default=None,
+        description="Path to this clip's ground-truth action array (.npy, shape "
+        "(num_actions, action_dim)), for the WAM. When set, the generated action tokens are "
+        "decoded and scored against it. Point it at a clip from the validation manifest, and use "
+        "that clip's own first frame and caption for the condition and prompt, or the number is "
+        "measuring the wrong thing.",
+    )
+
     video_dims: tuple[int, int, int] | None = Field(
         default=None,
         description="Per-sample override for (width, height, frames). None = inherit from ValidationConfig.",
@@ -448,8 +457,35 @@ class DataConfig(ConfigBaseModel):
         return str(path)
 
 
+class ActionValidationConfig(ConfigBaseModel):
+    """Scoring the WAM's generated actions against ground truth during validation.
+
+    Off unless set. When set, every sample carrying an ``actions`` path gets action slots in its
+    sequence, and the generated tokens are decoded and compared in physical units -- millimetres,
+    radians, gripper counts -- rather than in latent space, which is not a quantity anyone can
+    reason about.
+    """
+
+    action_vae: str = Field(
+        description="Directory holding action_vae.safetensors and config.json, the same one "
+        "process_actions.py encoded the training latents with. A different checkpoint would "
+        "decode into a different space and the error would be meaningless.",
+    )
+
+    num_actions: int = Field(
+        description="Action tokens per clip. Must match the training data: the manifest's arrays "
+        "are (num_actions, action_dim), and the sequence layout is built from this.",
+        gt=0,
+    )
+
+
 class ValidationConfig(ConfigBaseModel):
     """Configuration for validation during training"""
+
+    action: ActionValidationConfig | None = Field(
+        default=None,
+        description="WAM action scoring. None disables it and validation behaves exactly as before.",
+    )
 
     # Per-sample configuration (new format — preferred)
     samples: list[ValidationSample] = Field(
@@ -696,6 +732,46 @@ class ValidationConfig(ConfigBaseModel):
         if has_validation and not self.generate_video and not self.generate_audio:
             raise ValueError(
                 "At least one of generate_video or generate_audio must be True when validation is configured."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_action_scoring(self) -> "ValidationConfig":
+        """Check the action-scoring setup is coherent, at config load rather than at step N.
+
+        Both directions are mistakes worth catching early: a sample naming ground-truth actions
+        that will never be scored, and action scoring switched on with nothing to score.
+        """
+        scored = [i for i, sample in enumerate(self.samples) if sample.actions is not None]
+        if self.action is None:
+            if scored:
+                raise ValueError(
+                    f"validation samples {scored} give an 'actions' path but validation.action is "
+                    "unset, so nothing would score them. Set validation.action, or drop the paths."
+                )
+            return self
+
+        if not scored:
+            raise ValueError(
+                "validation.action is set but no sample gives an 'actions' path, so there is "
+                "nothing to score against."
+            )
+        if not self.generate_video:
+            raise ValueError(
+                "action scoring needs generate_video: the action tokens are interleaved into the "
+                "video sequence, so there is no sequence to put them in without it."
+            )
+
+        # There is one action layout, built from the shared video_dims and checked against the
+        # training data at startup. A per-sample override would give that sample a second layout
+        # nothing checks, so a sample carrying actions uses the shared dimensions.
+        overridden = [index for index in scored if self.samples[index].video_dims is not None]
+        if overridden:
+            raise ValueError(
+                f"validation samples {overridden} give an 'actions' path and also override "
+                "video_dims. A sample with actions has to use validation.video_dims: its action "
+                "tokens are laid out from that geometry, and that is the geometry checked against "
+                "the training data at startup."
             )
         return self
 

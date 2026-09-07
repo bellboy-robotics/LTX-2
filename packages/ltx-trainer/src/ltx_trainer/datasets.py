@@ -266,8 +266,12 @@ class PrecomputedDataset(Dataset):
             try:
                 data = torch.load(file_path, map_location="cpu", weights_only=True)
 
-                # Normalize video latent format if this is a latent source
-                if "latent" in dir_name.lower():
+                # Normalize video latent format if this is a latent source. Action latents are
+                # excluded by output key rather than by directory name, which is the user's to
+                # choose: they are a bare (num_actions, action_channels) tensor with no metadata
+                # to normalize, and being 2-D they are exactly what the legacy branch below
+                # mistakes for patchified video.
+                if "latent" in dir_name.lower() and output_key != "action_latents":
                     data = self._normalize_video_latents(data)
 
                 result[output_key] = data

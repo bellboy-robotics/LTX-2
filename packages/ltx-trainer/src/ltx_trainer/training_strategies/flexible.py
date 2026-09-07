@@ -15,6 +15,7 @@ import torch
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from torch import Tensor
 
+from ltx_core.action_layout import ActionTokenLayout
 from ltx_core.model.transformer.modality import Modality
 from ltx_core.types import SpatioTemporalScaleFactors
 from ltx_trainer.timestep_samplers import TimestepSampler
@@ -547,28 +548,14 @@ class FlexibleStrategy(TrainingStrategy):
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         """Splice the action tokens into the video sequence in timestamp order.
 
-        Action ``k`` is the transition from pixel frame ``k`` to ``k+1``, so its RoPE time is
-        ``k / fps`` and the frame it *produces* is ``k+1``. Each action token is placed
-        immediately after the video tokens of the latent frame holding the pixel frame it
-        produces -- grouping by destination rather than by source, matching how the windows were
-        cut in ``build_ltx_manifest.py``.
+        *Where* they go is :class:`ActionTokenLayout`'s business -- the same object the validation
+        runner builds, so training and inference cannot end up describing the sequence
+        differently. What belongs here is only the training-side content: padding the latents out
+        to the video channel count, noising them, and forming the velocity target.
 
-        With the causal VAE, latent frame 0 holds pixel frame 0 alone and latent frame ``f >= 1``
-        holds pixels ``S(f-1)+1 .. Sf`` for a temporal scale ``S`` of 8. So latent frame 0 -- the
-        conditioning frame, clean and excluded from the loss -- carries no action, nothing having
-        been predicted for it, and every later frame carries the ``S`` actions that produced its
-        ``S`` pixel frames. A 25-frame window lays out as::
-
-            880 video | 880 video | 8 actions | 880 video | 8 | 880 video | 8
-
-        Under bidirectional attention the placement is cosmetic -- RoPE carries the time and
-        attention is permutation-invariant. It matters only if attention is later made causal,
-        which is why the order follows the clock rather than appending at the tail.
-
-        Action latents are zero-padded from ``action_channels`` out to the video channel count so
-        the sequence stays a single tensor. They take the *same* sigma as the video tokens
-        (shared noise level, per the plan), and the padded channels are noised along with the
-        rest -- the loss ignores them via ``ModelInputs.action_channels``.
+        Action tokens take the *same* sigma as the video tokens, a shared noise level per the
+        plan, and the padded channels are noised along with the rest -- the loss ignores them via
+        ``ModelInputs.action_channels``.
 
         Args:
             action_latents: ``(B, n_actions, action_channels)`` from the frozen action VAE.
@@ -592,73 +579,31 @@ class FlexibleStrategy(TrainingStrategy):
                 "action interleaving requires a generated video modality: a conditioning-only one "
                 "has no targets or loss mask to splice into"
             )
-        batch_size, seq_len, channels = noisy_latents.shape
-        num_actions = action_latents.shape[1]
-        action_channels = action_latents.shape[2]
+        batch_size, _, channels = noisy_latents.shape
         device, dtype = noisy_latents.device, noisy_latents.dtype
+        layout = ActionTokenLayout.from_sequence(
+            num_actions=action_latents.shape[1],
+            num_frames=num_frames,
+            video_seq_len=noisy_latents.shape[1],
+            temporal_scale=int(self.video_scale_factors.time),
+            fps=fps,
+        )
 
-        if seq_len % num_frames:
-            raise ValueError(f"video sequence length {seq_len} is not divisible by {num_frames} latent frames")
-        tokens_per_frame = seq_len // num_frames
-        temporal_scale = int(self.video_scale_factors.time)
-
-        # Pad the action latents out to the video channel count.
-        padded = torch.zeros(batch_size, num_actions, channels, device=device, dtype=dtype)
-        padded[..., :action_channels] = action_latents.to(device=device, dtype=dtype)
-
-        # Same noise level as the video tokens, and the same velocity target.
-        noise = torch.randn_like(padded)
+        clean_actions = layout.pad_channels(action_latents.to(device=device, dtype=dtype), channels)
+        noise = torch.randn_like(clean_actions)
         sigmas_expanded = sigmas.view(-1, 1, 1)
-        noisy_actions = (1 - sigmas_expanded) * padded + sigmas_expanded * noise
-        action_targets = noise - padded
-        action_timesteps = sigmas.view(-1, 1).expand(batch_size, num_actions).clone()
-        action_loss_mask = torch.ones(batch_size, num_actions, dtype=torch.bool, device=device)
+        noisy_actions = (1 - sigmas_expanded) * clean_actions + sigmas_expanded * noise
 
-        # Positions: time is exactly k / fps, and actions have no spatial extent. The last axis
-        # holds [start, end) bounds and RoPE reads their midpoint, so zero-width bounds put the
-        # token at k / fps rather than half a frame later.
-        times = (torch.arange(num_actions, device=device, dtype=torch.float32) / fps).view(1, 1, num_actions, 1)
-        action_positions = torch.zeros(batch_size, 3, num_actions, 2, device=device, dtype=torch.float32)
-        action_positions[:, 0] = times.expand(batch_size, 1, num_actions, 2)[:, 0]
-
-        # Which latent frame each action belongs to: the one holding the pixel frame it produces.
-        groups = [k // temporal_scale + 1 for k in range(num_actions)]
-        if groups and groups[-1] >= num_frames:
-            raise ValueError(
-                f"{num_actions} actions at temporal scale {temporal_scale} need "
-                f"{groups[-1] + 1} latent frames but the video has {num_frames}"
-            )
-
-        latent_parts, target_parts, timestep_parts, mask_parts, position_parts, flag_parts = [], [], [], [], [], []
-        cursor = 0
-        for frame in range(num_frames):
-            start, end = frame * tokens_per_frame, (frame + 1) * tokens_per_frame
-            latent_parts.append(noisy_latents[:, start:end])
-            timestep_parts.append(timesteps[:, start:end])
-            position_parts.append(positions[:, :, start:end])
-            flag_parts.append(torch.zeros(batch_size, tokens_per_frame, dtype=torch.bool, device=device))
-            target_parts.append(targets[:, start:end])
-            mask_parts.append(loss_mask[:, start:end])
-
-            count = sum(1 for g in groups if g == frame)
-            if not count:
-                continue
-            stop = cursor + count
-            latent_parts.append(noisy_actions[:, cursor:stop])
-            timestep_parts.append(action_timesteps[:, cursor:stop])
-            position_parts.append(action_positions[:, :, cursor:stop])
-            flag_parts.append(torch.ones(batch_size, count, dtype=torch.bool, device=device))
-            target_parts.append(action_targets[:, cursor:stop])
-            mask_parts.append(action_loss_mask[:, cursor:stop])
-            cursor = stop
+        action_timesteps = sigmas.view(-1, 1).expand(batch_size, layout.num_actions)
+        action_loss_mask = torch.ones(batch_size, layout.num_actions, dtype=torch.bool, device=device)
 
         return (
-            torch.cat(latent_parts, dim=1),
-            torch.cat(target_parts, dim=1),
-            torch.cat(timestep_parts, dim=1),
-            torch.cat(mask_parts, dim=1),
-            torch.cat(position_parts, dim=2),
-            torch.cat(flag_parts, dim=1),
+            layout.interleave(noisy_latents, noisy_actions, dim=1),
+            layout.interleave(targets, noise - clean_actions, dim=1),
+            layout.interleave(timesteps, action_timesteps, dim=1),
+            layout.interleave(loss_mask, action_loss_mask, dim=1),
+            layout.interleave(positions, layout.positions(batch_size, device), dim=2),
+            layout.mask(batch_size, device),
         )
 
     @staticmethod
