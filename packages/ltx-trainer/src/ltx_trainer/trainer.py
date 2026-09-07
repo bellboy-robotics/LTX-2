@@ -813,9 +813,12 @@ class LtxvTrainer:
         and fps (the clock the action RoPE times are read off). The training side is read from a
         precomputed sample rather than from config, so it is what training will actually do.
         """
-        strategy = self._config.training_strategy
         validation = self._config.validation
-        if getattr(strategy, "action", None) is None or validation is None or validation.action is None:
+        if (
+            getattr(self._config.training_strategy, "action", None) is None
+            or validation is None
+            or validation.action is None
+        ):
             return
         assert self._dataset is not None
 
@@ -827,7 +830,9 @@ class LtxvTrainer:
             num_actions=sample["action_latents"].shape[0],
             num_frames=num_frames,
             video_seq_len=num_frames * height * width,
-            temporal_scale=int(strategy.video_scale_factors.time),
+            # From the strategy instance, not the config: __init__ reads the factors off the
+            # checkpoint's VAE config and attaches them there, because the YAML cannot know them.
+            temporal_scale=int(self._training_strategy.video_scale_factors.time),
             fps=float(latents.get("fps", DEFAULT_FPS)),
         )
         validation_layout = self._validation_runner.action_layout()
