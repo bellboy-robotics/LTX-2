@@ -726,7 +726,14 @@ class LtxvTrainer:
 
             if training_state.lr_scheduler_state_dict is not None and self._lr_scheduler is not None:
                 self._lr_scheduler.load_state_dict(training_state.lr_scheduler_state_dict)
-                logger.debug("Restored LR scheduler state")
+                # LinearLR and CosineAnnealingLR are chainable: each step() multiplies the
+                # optimizer's *current* lr rather than computing it from the step count. The
+                # state dict restores the step count but the lr itself lives in the optimizer,
+                # which in "minimal" mode is fresh -- so without this the schedule would resume
+                # from the initial lr and run high for the rest of the run.
+                for group, lr in zip(self._optimizer.param_groups, self._lr_scheduler.get_last_lr(), strict=True):
+                    group["lr"] = lr
+                logger.debug(f"Restored LR scheduler state (lr={self._lr_scheduler.get_last_lr()[0]:.2e})")
         except Exception as e:
             logger.warning(f"⚠️ Failed to restore training state: {e}. Starting from step 0.")
             return False
