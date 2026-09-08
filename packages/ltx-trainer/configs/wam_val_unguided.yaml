@@ -86,7 +86,7 @@ optimization:
 acceleration:
   mixed_precision_mode: "bf16"
   quantization: null
-  load_text_encoder_in_8bit: false
+  load_text_encoder_in_8bit: true
   # The VAE decoder needs the VRAM back during validation sampling.
   offload_optimizer_during_validation: true
 
