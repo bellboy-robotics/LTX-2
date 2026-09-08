@@ -295,6 +295,7 @@ class LtxvTrainer:
                             "train/global_step": self._global_step,
                         }
                         metrics.update(self._sigma_tracker.get_metrics())
+                        metrics.update(self._loss_component_metrics())
                         self._log_metrics(metrics)
 
                     # Fallback logging when progress bars are disabled
@@ -564,24 +565,47 @@ class LtxvTrainer:
         ``set_peft_model_state_dict`` only knows about adapter weights and silently drops
         everything else, so without this a resumed run would reset these parameters to their
         initial values and lose the training they had.
+
+        Restoring nothing is treated as an error rather than a warning. The failure it guards
+        against is invisible: ``action_scale_shift_table`` is zero-initialized, so a resume that
+        quietly skipped it would carry on training from zeros with no exception and no wrong
+        shape -- just a parameter silently reverted. A key-name mismatch between the save and
+        load sides is exactly how that would happen, and the two spellings differ by PEFT's
+        ``base_model.model.`` prefix.
         """
         patterns = self._config.lora.extra_trainable_params
         if not patterns:
             return
         unwrapped = self._accelerator.unwrap_model(self._transformer, keep_torch_compile=False)
         by_name = dict(unwrapped.named_parameters())
-        restored = 0
+        restored: list[str] = []
+        missing: list[str] = []
         for key, value in state_dict.items():
             if not any(pattern in key for pattern in patterns):
                 continue
             param = by_name.get(key) or by_name.get(f"base_model.model.{key}")
             if param is None:
-                logger.warning("Checkpoint holds '%s' but the model has no such parameter", key)
+                missing.append(key)
                 continue
             with torch.no_grad():
                 param.copy_(value.to(device=param.device, dtype=param.dtype))
-            restored += 1
-        logger.info("Restored %d extra trainable parameter tensors from the checkpoint", restored)
+            restored.append(key)
+
+        if missing:
+            raise ValueError(
+                f"the checkpoint holds {missing} but the model has no parameter of that name. "
+                "Either the checkpoint was written by a different model, or the naming changed "
+                "between saving and loading."
+            )
+        if not restored:
+            raise ValueError(
+                f"lora.extra_trainable_params={patterns} matched nothing in the checkpoint, so "
+                "those parameters would silently resume from their initial values -- zeros, for "
+                "action_scale_shift_table -- losing whatever they had learned. The checkpoint "
+                f"holds {sorted(state_dict)[:8]}... Either it predates the setting, or the save "
+                "and load sides disagree about key names."
+            )
+        logger.info("Restored %d extra trainable parameter tensors: %s", len(restored), ", ".join(restored))
 
     def _load_checkpoint(self) -> None:
         """Load checkpoint if specified in config, then resolve resume state."""
@@ -889,25 +913,33 @@ class LtxvTrainer:
         if scheduler_type is None:
             return None
 
+        # Accelerate's AcceleratedScheduler steps the wrapped scheduler once per process, on the
+        # assumption that scheduler lengths are counted in single-process dataloader batches
+        # (see its comment: "the training dataloader batch size was multiplied by num_processes").
+        # ``steps`` here counts optimizer steps, so without this the schedule finishes in
+        # steps / num_processes -- on 4 GPUs the LR hit its floor at 5,000 of 20,000 steps and sat
+        # there. Scaling the horizon makes the config mean the same thing on any GPU count.
+        horizon = steps * self._accelerator.num_processes
+
         if scheduler_type == "linear":
             scheduler = LinearLR(
                 optimizer,
                 start_factor=params.pop("start_factor", 1.0),
                 end_factor=params.pop("end_factor", 0.1),
-                total_iters=steps,
+                total_iters=horizon,
                 **params,
             )
         elif scheduler_type == "cosine":
             scheduler = CosineAnnealingLR(
                 optimizer,
-                T_max=steps,
+                T_max=horizon,
                 eta_min=params.pop("eta_min", 0),
                 **params,
             )
         elif scheduler_type == "cosine_with_restarts":
             scheduler = CosineAnnealingWarmRestarts(
                 optimizer,
-                T_0=params.pop("T_0", steps // 4),
+                T_0=params.pop("T_0", horizon // 4),
                 T_mult=params.pop("T_mult", 1),
                 eta_min=params.pop("eta_min", 5e-5),
                 **params,
@@ -915,14 +947,14 @@ class LtxvTrainer:
         elif scheduler_type == "polynomial":
             scheduler = PolynomialLR(
                 optimizer,
-                total_iters=steps,
+                total_iters=horizon,
                 power=params.pop("power", 1.0),
                 **params,
             )
         elif scheduler_type == "step":
             scheduler = StepLR(
                 optimizer,
-                step_size=params.pop("step_size", steps // 2),
+                step_size=params.pop("step_size", horizon // 2),
                 gamma=params.pop("gamma", 0.1),
                 **params,
             )
@@ -1062,6 +1094,18 @@ class LtxvTrainer:
 
         if world_size > 1:
             sampled = sorted(gather_object(sampled), key=lambda x: x[0])
+
+        # Same treatment as the sample paths: each rank scored only its slice of the samples, so
+        # the errors are gathered here and reported once, over the whole validation set.
+        # gather_object concatenates each rank's list into one flat list, the same as it does for
+        # ``sampled`` above -- no nesting to unpick.
+        action_errors = self._validation_runner.last_action_errors
+        if world_size > 1:
+            action_errors = gather_object(action_errors)
+        if action_errors and self._accelerator.is_main_process:
+            self._validation_runner.report_action_error(
+                torch.stack(action_errors), self._global_step, self._wandb_run
+            )
 
         paths = [p for _, p in sampled]
 
@@ -1288,6 +1332,31 @@ class LtxvTrainer:
             init_kwargs["resume"] = "must"
         run = wandb.init(**init_kwargs)
         self._wandb_run = run
+
+    def _loss_component_metrics(self) -> dict[str, float]:
+        """The video and action loss terms, separately, when the strategy splits them.
+
+        The combined loss says nothing about whether the action tokens are getting any of the
+        gradient: they are 24 of 3,544 positions, so a rising action term can hide entirely
+        inside the video one. ``action_share`` is the number that answers it -- the fraction of
+        the total that the weighted action term contributes -- and it is what makes
+        ``action.loss_weight`` a measurement rather than a guess.
+
+        Empty for a run without actions, so nothing changes for other strategies.
+        """
+        components = getattr(self._training_strategy, "last_loss_components", None)
+        if not components:
+            return {}
+        video = components["video_loss"].mean().item()
+        action = components["action_loss"].mean().item()
+        weighted = self._config.training_strategy.action.loss_weight * action
+        total = video + weighted
+        return {
+            "train/loss_video": video,
+            "train/loss_action": action,
+            "train/loss_action_weighted": weighted,
+            "train/action_share": weighted / total if total else 0.0,
+        }
 
     def _log_metrics(self, metrics: dict[str, float]) -> None:
         """Log metrics to Weights & Biases."""

@@ -186,6 +186,9 @@ class ValidationRunner:
         # after an hour of training.
         self._action_decoder = None
         self._action_truth: dict[int, Tensor] = {}
+        # Populated by run(); initialized here so a caller can read it even if run() returned
+        # early on an empty sample list.
+        self.last_action_errors: list[Tensor] = []
         if self._config.action is not None:
             self._action_decoder = load_action_decoder(self._config.action.action_vae)
             self._action_truth = self._load_action_truth()
@@ -334,7 +337,11 @@ class ValidationRunner:
         samples_dir.mkdir(exist_ok=True, parents=True)
 
         results: list[tuple[int, Path]] = []
-        action_errors: list[Tensor] = []
+        # Collected, not reported. Distributed validation gives each rank a slice of the samples,
+        # so a per-rank report would be an average over 2 of 8 -- too few to read a trend from.
+        # The trainer gathers these across ranks and calls report_action_error, the same way it
+        # gathers the sample paths before logging them.
+        self.last_action_errors: list[Tensor] = []
 
         for local_i, (sample_idx, save_output) in enumerate(work_items):
             sample = samples[sample_idx]
@@ -356,7 +363,7 @@ class ValidationRunner:
                 continue
 
             if actions is not None and sample_idx in self._action_truth:
-                action_errors.append(actions - self._action_truth[sample_idx])
+                self.last_action_errors.append(actions - self._action_truth[sample_idx])
 
             dims = sample.video_dims or self._config.video_dims
             num_frames = dims[2]
@@ -386,15 +393,12 @@ class ValidationRunner:
         rel_path = samples_dir.relative_to(output_dir)
         logger.info(f"🎥 Validation samples for step {step} saved in {rel_path}")
 
-        if action_errors:
-            self._report_action_error(torch.stack(action_errors), step, wandb_run)
-
         if wandb_run is not None and results:
             self.log_to_wandb(wandb_run, [p for _, p in results], step)
 
         return results
 
-    def _report_action_error(self, errors: Tensor, step: int, wandb_run: object | None) -> None:
+    def report_action_error(self, errors: Tensor, step: int, wandb_run: object | None) -> None:
         """Log how far the generated actions fell from ground truth, in physical units.
 
         Args:
@@ -407,9 +411,8 @@ class ValidationRunner:
         small bias that always points the same way walks the gripper off target while the mean
         absolute error still looks fine.
 
-        Under distributed validation each rank sees only its own samples, so this is a per-rank
-        report. With a handful of samples split across ranks that is usually the whole set on
-        rank 0; treat it as a trend line, not a precise dataset average.
+        Called by the trainer on the main process, with the errors already gathered from every
+        rank, so the numbers cover the whole validation set rather than one rank's slice.
         """
         absolute = errors.abs().mean(dim=(0, 1))
         signed = errors.mean(dim=(0, 1))
