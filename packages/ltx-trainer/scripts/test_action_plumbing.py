@@ -25,9 +25,8 @@ from __future__ import annotations
 import torch
 
 from ltx_core.action_layout import ActionTokenLayout
-from ltx_core.model.transformer.model import LTXModel
 from ltx_core.model.transformer.modality import Modality
-from ltx_core.types import LTXModelType
+from ltx_core.model.transformer.model import LTXModel, LTXModelType
 
 CHECKS: list[tuple[str, bool, str]] = []
 
@@ -41,7 +40,7 @@ def build() -> tuple[LTXModel, ActionTokenLayout]:
     """A small video-only model with an action stream, and the layout for its sequence."""
     torch.manual_seed(0)
     model = LTXModel(
-        model_type=LTXModelType.Video,
+        model_type=LTXModelType.VideoOnly,
         num_attention_heads=4,
         attention_head_dim=16,
         in_channels=128,
