@@ -22,6 +22,8 @@ Every check prints PASS or FAIL and the number it is based on.
 
 from __future__ import annotations
 
+import dataclasses
+
 import torch
 
 from ltx_core.action_layout import ActionTokenLayout
@@ -72,6 +74,18 @@ def make_modality(layout: ActionTokenLayout, model: LTXModel, batch: int = 1) ->
         context_mask=None,
         action_mask=layout.mask(batch, device),
     )
+
+
+def perturb_rows(layout: ActionTokenLayout, model: LTXModel, rows: list[int]) -> Modality:
+    """The same sequence with noise added to ``rows`` of the latent, everything else identical.
+
+    ``make_modality`` reseeds, so the untouched rows are bit-for-bit the ones ``base`` was
+    computed from and any difference in the output comes from ``rows`` alone.
+    """
+    modality = make_modality(layout, model)
+    latent = modality.latent.clone()
+    latent[:, rows] += torch.randn_like(latent[:, rows])
+    return dataclasses.replace(modality, latent=latent)
 
 
 @torch.no_grad()
@@ -194,6 +208,37 @@ def main() -> None:
         "a video-only loss does not reach action_out",
         norm == 0.0,
         f"action_out grad norm from a video-only loss: {norm:.4e} (want exactly 0)",
+    )
+
+    # 7. Conditioning. Everything above perturbs a *weight*, which can only ask whether a
+    #    parameter is wired to an output. This perturbs the *input*, which is the only way to ask
+    #    whether the two streams see each other through self-attention -- and that is the question
+    #    behind the validation result: a head that cannot read the video can only ever emit the
+    #    dataset's average motion, which is what "worse than predicting zero" looks like.
+    #
+    #    The first check is a control on this harness. If changing one video row does not move the
+    #    *other* video rows, these two blocks are not mixing tokens at all, and every "exactly 0"
+    #    printed above passed for the wrong reason and means nothing.
+    first_video, rest_video = video_idx[0], video_idx[1:]
+
+    moved = (run_forward(model, perturb_rows(layout, model, [first_video])) - base).abs()
+    check(
+        "attention mixes tokens at all",
+        moved[:, rest_video].mean().item() > 0,
+        f"changing one video row moved the other video rows by {moved[:, rest_video].mean().item():.4e}",
+    )
+    check(
+        "one video row reaches the action rows",
+        moved[:, action_idx].mean().item() > 0,
+        f"changing one video row moved the action rows by {moved[:, action_idx].mean().item():.4e}",
+    )
+
+    # And the whole video at once -- the signal the action head actually has to condition on.
+    moved = (run_forward(model, perturb_rows(layout, model, video_idx)) - base).abs()
+    check(
+        "the action head sees the video",
+        moved[:, action_idx].mean().item() > 0,
+        f"changing every video row moved the action rows by {moved[:, action_idx].mean().item():.4e}",
     )
 
     failed = [name for name, passed, _ in CHECKS if not passed]
