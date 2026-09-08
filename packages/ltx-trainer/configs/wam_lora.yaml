@@ -23,7 +23,7 @@ model:
   model_path: "/mnt/filestore/users/shoval/models/ltx-2.5/ltx-2.5-22b-pt-bf16.safetensors"
   text_encoder_path: "/mnt/filestore/users/shoval/models/ltx-2.5/ltx-2.5-22b-gemma4-12b"
   training_mode: "lora"
-  load_checkpoint: null
+  load_checkpoint: "outputs/wam_lora_v2/checkpoints"
 
 lora:
   rank: 32
