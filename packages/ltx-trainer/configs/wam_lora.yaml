@@ -76,7 +76,12 @@ optimization:
   optimizer_type: "adamw"
   scheduler_type: "linear"
   scheduler_params: {}
-  enable_gradient_checkpointing: true
+
+  # Off: the run is compute-bound at ~10.5 s/step and checkpointing pays one extra forward
+  # pass per step to avoid keeping activations. With the frozen 22B weights at ~44 GB and
+  # 53.7 GB in use, there is room for the ~14 GB of activations 48 unchecked blocks hold.
+  # The peak is the same on every step, so if step 1 survives the run does.
+  enable_gradient_checkpointing: false
 
 acceleration:
   mixed_precision_mode: "bf16"
@@ -203,4 +208,4 @@ wandb:
   log_validation_videos: true
 
 seed: 42
-output_dir: "outputs/wam_lora"
+output_dir: "outputs/wam_lora_v2"
