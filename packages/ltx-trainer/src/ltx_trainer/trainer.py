@@ -1368,4 +1368,8 @@ class LtxvTrainer:
     def _log_metrics(self, metrics: dict[str, float]) -> None:
         """Log metrics to Weights & Biases."""
         if self._wandb_run is not None:
-            self._wandb_run.log(metrics)
+            # Explicit step, as validation already does. Without it wandb advances its own counter
+            # per call, and after a resume that counter runs ahead of the training step -- so every
+            # validation log (media, action MAE), which names the real step, is rejected as out of
+            # order for the rest of the run.
+            self._wandb_run.log(metrics, step=self._global_step)
