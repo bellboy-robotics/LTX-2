@@ -1,0 +1,229 @@
+# =============================================================================
+# World Action Model — LoRA finetune of LTX-2.5
+# =============================================================================
+#
+# Trains the model to generate future video *and* the robot actions that produce
+# it, from a first frame and a task instruction. Action tokens are interleaved
+# into the video sequence in timestamp order -- one per 15 Hz step, placed after
+# the latent frame holding the pixel frame it produces -- sharing the video's
+# noise level, RoPE clock and self-attention. They enter and leave the
+# transformer through action_in / action_out rather than patchify_proj /
+# proj_out. At deploy only the action tokens drive the arm.
+#
+# Stride-12 ablation of wam_lora.yaml: windows step 12 frames instead of 4, so a
+# third of the clips over the same 781 episodes. Everything else is held fixed --
+# same holdout episodes, same lambda, same rank, same LR -- so the only variable is
+# how densely the episodes are sampled.
+#
+# Data layout:
+#   .precomputed/                  11,100 training clips (781 episodes, stride 12)
+#   ├── latents/                   video, 128 x 4 x 22 x 40 at 1280x704x25
+#   ├── conditions/                Gemma text embeddings (781 real files, hardlinked)
+#   └── action_latents/            frozen action VAE, (24, 7) per clip
+#   The 40 held-out episodes are not precomputed: validation reads their mp4 and
+#   .npy directly and encodes the first frame itself.
+# =============================================================================
+
+model:
+  model_path: "/mnt/filesystem-f2/users/shoval/models/ltx-2.5/ltx-2.5-22b-pt-bf16.safetensors"
+  text_encoder_path: "/mnt/filesystem-f2/users/shoval/models/ltx-2.5/ltx-2.5-22b-gemma4-12b"
+  training_mode: "lora"
+  load_checkpoint: null
+
+lora:
+  rank: 32
+  alpha: 32
+  dropout: 0.0
+
+  target_modules:
+    - "to_k"
+    - "to_q"
+    - "to_v"
+    - "to_out.0"
+
+  # New Linears with no pretrained weights to adapt: a low-rank update to a random
+  # matrix would be pointless, so these train in full and are saved with the adapter.
+  modules_to_save:
+    - "action_in"
+    - "action_out"
+
+  # A bare nn.Parameter, which PEFT's modules_to_save cannot reach -- it wraps
+  # modules, not parameters. Matched by substring and written into the checkpoint.
+  extra_trainable_params:
+    - "action_scale_shift_table"
+
+training_strategy:
+  name: "flexible"
+
+  video:
+    is_generated: true
+    latents_dir: "latents"
+    conditions:
+      # Always on, unlike the 0.5 an I2V finetune uses. At deploy the arm always has
+      # the current camera frame, so there is no text-only mode to preserve.
+      - type: first_frame
+        probability: 1.0
+
+  action:
+    latents_dir: "action_latents"
+    # Paired with wam_lora_s12.yaml (lambda 5) on identical data. At 5 the action term took
+    # 72-96% of every update to the shared LoRA weights, and video loss still improved
+    # (0.180 -> 0.162), so the usual reason to lower it -- the other objective starving --
+    # does not apply. The reason to try 1 is different: the LoRA is shared, the action
+    # objective is the one that overfits, and the video objective is one the base model
+    # already generalises at. Giving it a real share may hold the shared representation
+    # somewhere an action head can generalise from.
+    #
+    # Reading the result: at lambda 1 the action term is a fifth of what it was, so
+    # loss_action falls more slowly. A worse MAE at 20k could mean "not converged" rather
+    # than "worse lambda" -- read loss_action and loss_video alongside it. If the mechanism
+    # above is real, video loss should drop below 0.162 as the action MAE improves.
+    loss_weight: 1.0
+
+  # No audio: the dataset has none and the precompute ran with --skip-audio.
+
+optimization:
+  learning_rate: 1e-4
+  steps: 20000
+  # 8 GPUs, so 1 x 1 x 8 = 8 clips per step -- 20,000 steps is 14.4 epochs of 11,100,
+  # against 9.8 for the 4-GPU stride-4 run. Accumulation is 1, matching Lightricks'
+  # own configs; the 4 in wam_lora.yaml was a guess, never measured against anything.
+  batch_size: 1
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+  optimizer_type: "adamw"
+  scheduler_type: "linear"
+  scheduler_params: {}
+
+  # Measured on the A100s: off, it OOMs on the first training step. Untested on H100
+  # with accumulation 1, where the activation peak is lower -- worth trying off once
+  # the run is known to work, since it buys about a quarter of the step time.
+  enable_gradient_checkpointing: true
+
+acceleration:
+  mixed_precision_mode: "bf16"
+  quantization: null
+  load_text_encoder_in_8bit: false
+  # The VAE decoder needs the VRAM back during validation sampling.
+  offload_optimizer_during_validation: true
+
+data:
+  preprocessed_data_root: "/mnt/filesystem-f2/users/shoval/hf-cache/lerobot/bellboy-robotics/TD-WAM-720p-8tasks/.precomputed"
+  num_dataloader_workers: 2
+
+validation:
+  # Decode the generated action tokens and score them against ground truth. Reported
+  # per dimension in millimetres, radians and gripper counts -- the three are not
+  # commensurable, so there is no single number.
+  action:
+    action_vae: "/mnt/filesystem-f2/users/shoval/LTX-2/runs/avae_l7_b3e-5_h64"
+    num_actions: 24
+
+  # One clip per task, from the held-out episodes. Each sample's prompt is that clip's
+  # own caption and its condition that clip's own first frame, so the generated actions
+  # have ground truth to be compared against.
+  samples:
+    - prompt: "pull open the cabinet door"
+      actions: "/mnt/filesystem-f2/users/shoval/hf-cache/lerobot/bellboy-robotics/TD-WAM-720p-8tasks/videos_15fps/episode_000010_w00000.npy"
+      conditions:
+        - type: first_frame
+          image_or_video: "/mnt/filesystem-f2/users/shoval/hf-cache/lerobot/bellboy-robotics/TD-WAM-720p-8tasks/videos_15fps/episode_000010_w00000.mp4"
+
+    - prompt: "grasp the salt shaker and lift it"
+      actions: "/mnt/filesystem-f2/users/shoval/hf-cache/lerobot/bellboy-robotics/TD-WAM-720p-8tasks/videos_15fps/episode_000030_w00000.npy"
+      conditions:
+        - type: first_frame
+          image_or_video: "/mnt/filesystem-f2/users/shoval/hf-cache/lerobot/bellboy-robotics/TD-WAM-720p-8tasks/videos_15fps/episode_000030_w00000.mp4"
+
+    - prompt: "dust the cabinet shelves"
+      actions: "/mnt/filesystem-f2/users/shoval/hf-cache/lerobot/bellboy-robotics/TD-WAM-720p-8tasks/videos_15fps/episode_000138_w00000.npy"
+      conditions:
+        - type: first_frame
+          image_or_video: "/mnt/filesystem-f2/users/shoval/hf-cache/lerobot/bellboy-robotics/TD-WAM-720p-8tasks/videos_15fps/episode_000138_w00000.mp4"
+
+    - prompt: "press both light switches, then look back at the lit ceiling light"
+      actions: "/mnt/filesystem-f2/users/shoval/hf-cache/lerobot/bellboy-robotics/TD-WAM-720p-8tasks/videos_15fps/episode_000228_w00000.npy"
+      conditions:
+        - type: first_frame
+          image_or_video: "/mnt/filesystem-f2/users/shoval/hf-cache/lerobot/bellboy-robotics/TD-WAM-720p-8tasks/videos_15fps/episode_000228_w00000.mp4"
+
+    - prompt: "open the drawer, lifting to see what is inside"
+      actions: "/mnt/filesystem-f2/users/shoval/hf-cache/lerobot/bellboy-robotics/TD-WAM-720p-8tasks/videos_15fps/episode_000269_w00000.npy"
+      conditions:
+        - type: first_frame
+          image_or_video: "/mnt/filesystem-f2/users/shoval/hf-cache/lerobot/bellboy-robotics/TD-WAM-720p-8tasks/videos_15fps/episode_000269_w00000.mp4"
+
+    - prompt: "open the toilet cover and seat, then move upward"
+      actions: "/mnt/filesystem-f2/users/shoval/hf-cache/lerobot/bellboy-robotics/TD-WAM-720p-8tasks/videos_15fps/episode_000307_w00000.npy"
+      conditions:
+        - type: first_frame
+          image_or_video: "/mnt/filesystem-f2/users/shoval/hf-cache/lerobot/bellboy-robotics/TD-WAM-720p-8tasks/videos_15fps/episode_000307_w00000.mp4"
+
+    - prompt: "move to the cart and hold it"
+      actions: "/mnt/filesystem-f2/users/shoval/hf-cache/lerobot/bellboy-robotics/TD-WAM-720p-8tasks/videos_15fps/episode_000507_w00000.npy"
+      conditions:
+        - type: first_frame
+          image_or_video: "/mnt/filesystem-f2/users/shoval/hf-cache/lerobot/bellboy-robotics/TD-WAM-720p-8tasks/videos_15fps/episode_000507_w00000.mp4"
+
+    - prompt: "tap the lock sensor, then push the handle and open the door"
+      actions: "/mnt/filesystem-f2/users/shoval/hf-cache/lerobot/bellboy-robotics/TD-WAM-720p-8tasks/videos_15fps/episode_000562_w00000.npy"
+      conditions:
+        - type: first_frame
+          image_or_video: "/mnt/filesystem-f2/users/shoval/hf-cache/lerobot/bellboy-robotics/TD-WAM-720p-8tasks/videos_15fps/episode_000562_w00000.mp4"
+
+  negative_prompt: >-
+    blurry, out of focus, overexposed, underexposed, low contrast, washed out colors, excessive
+    noise, grainy texture, poor lighting, flickering, motion blur, distorted proportions, deformed
+    gripper, extra limbs, jittery movement, unnatural transitions, inconsistent framing, camera
+    shake, cartoonish rendering, 3D CGI look, unrealistic materials, or AI artifacts.
+
+  # Must match the training data exactly, or _check_action_layout_matches_validation
+  # refuses to start: 1280/32 = 40 and 704/32 = 22 give 880 tokens per latent frame,
+  # and (25-1)/8+1 = 4 latent frames, which is what the precomputed latents hold.
+  video_dims: [1280, 704, 25]
+
+  # Likewise: the precomputed latents store fps 15.0, and the action RoPE times are
+  # read off this clock.
+  frame_rate: 15.0
+
+  seed: 42
+  inference_steps: 30
+
+  # 8 samples x 30 steps x 1 forward pass = 240 forwards, a third of the guided cost.
+  # Guidance is off below: measured worse on the action tokens at three checkpoints
+  # (step 6500: 7.75/4.66/8.28 mm guided vs 5.71/3.56/4.27 unguided, dx/dy/dz).
+  interval: 500
+
+  video_cfg_scale: 1.0
+  video_stg_scale: 0.0
+  stg_blocks: [28]
+  guidance_rescale: 0.7
+
+  generate_audio: false
+
+  # Run once before any training. The action error at step 0 is the untrained baseline
+  # every later number is read against.
+  skip_initial_validation: false
+
+checkpoints:
+  interval: 500
+  keep_last_n: -1
+  precision: "bfloat16"
+
+flow_matching:
+  timestep_sampling_mode: "shifted_logit_normal"
+  timestep_sampling_params: {}
+
+hub:
+  push_to_hub: false
+  hub_model_id: null
+
+wandb:
+  enabled: true
+  project: "bellboy-wam"
+  entity: null
+  tags: ["ltx2.5", "lora", "wam", "actions", "stride12", "8gpu", "lambda1"]
+  log_validation_videos: true
+
+seed: 42
+output_dir: "outputs/wam_lora_s12_lam1"
