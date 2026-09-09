@@ -1045,6 +1045,7 @@ class ValidationRunner:
             if action_layout is None or video_state is None
             else action_layout.mask(video_state.latent.shape[0], device)
         )
+        exclude_actions_from_guidance = cfg.action is not None and cfg.action.exclude_from_guidance
 
         x0_model = X0Model(transformer)
 
@@ -1102,6 +1103,12 @@ class ValidationRunner:
             denoised_video, denoised_audio = pos_video, pos_audio
             if not video_frozen and pos_video is not None:
                 denoised_video = video_guider.calculate(pos_video, neg_video, ptb_video, mod_video)
+                # Guidance is per-row arithmetic, so the two streams need not share a scale. The
+                # video rows keep CFG/STG; the action rows take pos_video, which is the plain
+                # conditional prediction -- the quantity training minimised against ground truth.
+                # No extra forward pass: pos_video is already in hand.
+                if action_mask is not None and exclude_actions_from_guidance:
+                    denoised_video = torch.where(action_mask.unsqueeze(-1), pos_video, denoised_video)
             if not audio_frozen and pos_audio is not None:
                 denoised_audio = audio_guider.calculate(pos_audio, neg_audio, ptb_audio, mod_audio)
 

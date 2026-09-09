@@ -101,6 +101,7 @@ validation:
   action:
     action_vae: "/mnt/filestore/users/shoval/LTX-2/runs/avae_l7_b3e-5_h64"
     num_actions: 24
+    exclude_from_guidance: false
 
   # One clip per task, from the held-out episodes. Each sample's prompt is that clip's
   # own caption and its condition that clip's own first frame, so the generated actions

@@ -478,6 +478,16 @@ class ActionValidationConfig(ConfigBaseModel):
         gt=0,
     )
 
+    exclude_from_guidance: bool = Field(
+        default=True,
+        description="Give the action rows the plain conditional prediction while the video rows "
+        "keep CFG/STG. Guidance extrapolates past the conditional estimate, which sharpens pixels "
+        "but biases a quantity in millimetres -- measured worse on every action channel at three "
+        "checkpoints (step 6500: 7.75/4.66/8.28 mm guided vs 5.71/3.56/4.27 unguided, dx/dy/dz). "
+        "Training applies no guidance at all, so the unguided rows are also what the loss scored. "
+        "Set False to put the action rows back under the video's guidance scales.",
+    )
+
 
 class ValidationConfig(ConfigBaseModel):
     """Configuration for validation during training"""

@@ -101,7 +101,7 @@ validation:
   action:
     action_vae: "/mnt/filestore/users/shoval/LTX-2/runs/avae_l7_b3e-5_h64"
     num_actions: 24
-    exclude_from_guidance: false
+    exclude_from_guidance: true
 
   # One clip per task, from the held-out episodes. Each sample's prompt is that clip's
   # own caption and its condition that clip's own first frame, so the generated actions
@@ -177,8 +177,8 @@ validation:
   # Raise this if validation starts costing more than the training between it.
   interval: 500
 
-  video_cfg_scale: 1.0
-  video_stg_scale: 0.0
+  video_cfg_scale: 3.0
+  video_stg_scale: 1.0
   stg_blocks: [28]
   guidance_rescale: 0.7
 
@@ -209,4 +209,4 @@ wandb:
   log_validation_videos: true
 
 seed: 42
-output_dir: "outputs/wam_val_unguided"
+output_dir: "outputs/wam_val_mixed"
