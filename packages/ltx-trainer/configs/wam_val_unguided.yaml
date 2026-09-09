@@ -23,7 +23,7 @@ model:
   model_path: "/mnt/filestore/users/shoval/models/ltx-2.5/ltx-2.5-22b-pt-bf16.safetensors"
   text_encoder_path: "/mnt/filestore/users/shoval/models/ltx-2.5/ltx-2.5-22b-gemma4-12b"
   training_mode: "lora"
-  load_checkpoint: "outputs/wam_lora_v2/checkpoints/lora_weights_step_01000.safetensors"
+  load_checkpoint: "outputs/wam_lora_v2/checkpoints/lora_weights_step_06500.safetensors"
 
 lora:
   rank: 32
@@ -69,7 +69,7 @@ training_strategy:
 
 optimization:
   learning_rate: 1e-4
-  steps: 1001
+  steps: 6501
   batch_size: 1
   gradient_accumulation_steps: 4
   max_grad_norm: 1.0
